@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Entry point the conformance runner spawns (--adapter python=<this file>). Zero dependencies,
+# so no venv: any python3 >= 3.11 runs the SDK straight from src/. -I (isolated) ignores
+# PYTHON* variables and keeps the adapter's own directory off sys.path; adapter.py adds src/.
+# WSMIXER_PYTHON picks the interpreter.
+set -euo pipefail
+dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null && pwd)"
+exec "${WSMIXER_PYTHON:-python3}" -I "$dir/adapter.py"

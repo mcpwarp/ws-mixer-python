@@ -1,0 +1,70 @@
+[build-system]
+# 1.27 is the first release whose default core metadata (2.4) carries PEP 639 license fields.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ws-mixer"
+dynamic = ["version"]
+description = "ws-mixer.v1 client SDK and mcpwarp helper: N byte streams over one WebSocket, asyncio, zero dependencies."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Framework :: AsyncIO",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+websockets = ["websockets>=13,<18"]
+certifi = ["certifi"]
+
+[project.urls]
+Homepage = "https://github.com/mcpwarp/ws-mixer-python"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "jsonschema",
+    "types-jsonschema",
+    "mypy",
+    "ruff",
+    "websockets",
+    "starlette",
+]
+
+[tool.hatch.version]
+path = "src/ws_mixer/_version.py"
+pattern = "SDK_VERSION = \"(?P<version>[^\"]+)\""
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ws_mixer"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.spec", "/.goserver", "/build", "/.github", "/tests", "/uv.lock", "/Makefile"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
+mypy_path = "src"
+explicit_package_bases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--import-mode=importlib"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error"]
