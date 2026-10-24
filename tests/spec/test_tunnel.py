@@ -50,7 +50,7 @@ from ws_mixer.mcpwarp.expose import Exposure
 from ws_mixer.socket import WebSocketInit
 from ws_mixer.testing import FakeClock, FakeConnector, FakeWebSocket
 
-# The fixture count at spec.pin v0.8.0: 01-45 without 33, plus ms_01-ms_14.
+# The fixture count at spec.pin v0.8.1: 01-45 without 33, plus ms_01-ms_14.
 TUNNEL_FIXTURES = 58
 PROFILE_SKIP = "host guidance, §10.6 Fixture status"
 # Section 10.6: group fixtures for the multi-service controller (section 6A).

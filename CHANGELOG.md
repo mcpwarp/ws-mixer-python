@@ -4,7 +4,7 @@ All notable changes to `ws-mixer` (the Python client SDK) are documented here.
 
 ## 0.1.0 - Unreleased
 
-First release. Client role of ws-mixer-spec v0.8.0 (`spec.pin`; what still differs is in
+First release. Client role of ws-mixer-spec v0.8.1 (`spec.pin`; what still differs is in
 [docs/DEVIATIONS.md](docs/DEVIATIONS.md)). Single-service, as every SDK is since v0.8.0
 (MCPWARP.md section 1): no multi-service controller, and the multi-service host guidance
 fixtures are skipped as section 10.6 says. Pair-tested against

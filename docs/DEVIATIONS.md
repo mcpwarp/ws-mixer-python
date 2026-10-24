@@ -1,21 +1,21 @@
 # Deviations
 
-Every known place where this SDK differs from the spec text at `spec.pin` (v0.8.0) or from
+Every known place where this SDK differs from the spec text at `spec.pin` (v0.8.1) or from
 ws-mixer-js 0.11.2, and why. Each entry has one mark:
 
 - **spec-ruled**: the spec session ruled on it, the ruling is not in the pinned text yet, and
   the SDK already follows it.
-- **in spec at v0.6.2** / **in spec at v0.6.3** / **in spec at v0.7.1**: was spec-ruled; the
-  pinned spec text now says it, so it is no longer a deviation. Kept for the ruling history.
-  An entry may also name the later tag that clarified it (v0.7.2, v0.8.0).
+- **in spec at v0.6.2** / **in spec at v0.6.3** / **in spec at v0.7.1** / **in spec at
+  v0.8.1**: was spec-ruled; the pinned spec text now says it, so it is no longer a deviation.
+  Kept for the ruling history. An entry may also name the later tag that clarified it (v0.7.2,
+  v0.8.0, v0.8.1).
 - **open**: the pinned spec text says otherwise and the SDK does not follow it yet.
 - **JS deviation**: the behaviour differs from ws-mixer-js; the spec allows both, or does not
   say.
 - **Python choice**: a decision of this SDK where the spec is silent, stale or still pending.
 - **profile**: a part of the pinned spec no SDK ships (MCPWARP.md section 1); not a deviation.
 
-One entry is spec-ruled (text in v0.8.1): envelope schema verdicts are not asserted. No entry
-is open.
+No entry is spec-ruled and none is open.
 
 Rulings are quoted from the spec session's answers of 2026-10-14 (item numbers are theirs) and
 the later v0.6.3 rulings.
@@ -43,13 +43,16 @@ scope is unchanged. It does not implement:
 The fixture runners skip the matching host guidance fixtures by a declared allow-list, as
 section 10.6 Fixture status says (docs/CONFORMANCE.md, Profile).
 
-### Envelope schema verdicts are not asserted (spec-ruled, text in v0.8.1)
+### Envelope schema verdicts are not asserted (in spec at v0.8.1)
 
-v0.8.0 (MCPWARP.md sections 10.1 and 10.6, Fixture status) still has an SDK run the envelope
+v0.8.0 (MCPWARP.md sections 10.1 and 10.6, Fixture status) still had an SDK run the envelope
 schema-verdict cases, `register_batch_valid`, `register_two_services` and
 `register_batch_101_invalid` included. The spec session's binding clarification of 2026-10-24
-says schema verdicts are checker/CI tooling and an SDK runner asserts wire verdicts on decode
-cases only; the text lands in v0.8.1. `tests/spec/test_envelope.py` therefore skips the schema
+said schema verdicts are checker/CI tooling and an SDK runner asserts wire verdicts on decode
+cases only. v0.8.1 says so (D-2026-10-24-05): sections 10.1 and 10.6 mark those three
+`checker (CI)`, and `spec/README.md` keeps its general rule (SDK runtime validators assert
+`wire_valid`, schema/CI tooling asserts `schema_valid`), which covers the six single-service
+`SCHEMA_*` rows as well. `tests/spec/test_envelope.py` therefore skips the schema
 check of those two encode-only cases (with the host guidance skip) and skips the nine
 agent->edge cases whose only verdict is the edge's schema check (`SCHEMA_*` hints and
 `register_batch_101_invalid`), with the reason `schema verdict only, checker/CI tooling, §10.6`.
@@ -200,11 +203,11 @@ HTTP dates parse in IMF-fixdate, RFC 850 and `+0000` forms, not asctime, ISO 860
 which JS `Date.parse` accepts. A repeated header arrives joined (`5, 10`) and gives no hint,
 where Node takes the first value. Low impact: the edge sends delta-seconds.
 
-### `welcome` and a close in one burst (in spec at v0.8.0; clarification text in v0.8.1)
+### `welcome` and a close in one burst (in spec at v0.8.1)
 
 A connection whose close arrives in the same delivery burst as its `welcome` "never becomes
-current, and only its disconnect is reported" (CLIENT-SDK.md Handler delivery, D-2026-10-24-03;
-clarified for v0.8.1): no frame of that burst behind the `welcome` (an `app`, a `drain`, a
+current" (CLIENT-SDK.md Handler delivery, D-2026-10-24-03; v0.8.1, D-2026-10-24-05, words it
+as below): no frame of that burst behind the `welcome` (an `app`, a `drain`, a
 stream `OPEN`) is delivered to the application, and the retry after it is the connected-phase
 disconnect's (`phase` `"connected"`, that close code's reconnect policy), never the handshake
 failure path. A connected report before that disconnect is allowed, and Python makes one: it
@@ -310,7 +313,11 @@ sections 2.3 Empty reply, 2.6, 2.7, 3.2, 6.7 T13/T25/T26). v0.7.2 (D-2026-10-19-
 counter examples, the pause rule and the close skip below; v0.8.0 (D-2026-10-24-03) says the
 `OVERLOADED` counter resets only on a reply that answers the outstanding frame (earlier 0.1.0
 builds also reset it on a `registered` or `unregistered` answering none, such as a stray one
-while close()'s dropped `unregister` waited for its re-send). The counter counts on one
+while close()'s dropped `unregister` waited for its re-send). v0.8.1 (D-2026-10-24-05) spells
+out section 2.6's split between an outstanding and a re-queued frame, the stray `registered`
+that changes no counter, and the `close()` case where the `unregistered` of an `unregister`
+behind a dropped `register` does reset it; a stray `unregistered` is covered by the general
+rule only. The counter counts on one
 connection: a new `welcome` starts it over (earlier 0.1.0 builds carried it across
 reconnects).
 

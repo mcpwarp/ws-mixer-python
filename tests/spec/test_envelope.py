@@ -42,7 +42,7 @@ from ws_mixer.mcpwarp import (
     is_valid_service_name,
 )
 
-# The fixture count at spec.pin v0.8.0.
+# The fixture count at spec.pin v0.8.1.
 ENVELOPE_FIXTURES = 68
 AGENT_TO_EDGE = {"register", "unregister"}
 PROFILE_SKIP = "host guidance, §10.6 Fixture status"
