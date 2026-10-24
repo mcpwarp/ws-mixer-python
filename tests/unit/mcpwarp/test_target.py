@@ -158,6 +158,57 @@ async def test_query_merge(target_query: str, incoming: str, line: str) -> None:
         assert not any(h.lower().startswith("content-length") for h in up.head_lines())
 
 
+async def test_brackets_in_the_configured_target_are_kept() -> None:
+    async with Upstream(OK) as up:
+        res = await target_handler(up.origin + "/api[v1]/mcp?k=[x]")(request("GET"))
+        await collect(res.body)
+        assert up.head_lines()[0] == "GET /api[v1]/mcp?k=[x] HTTP/1.1"
+
+
+@pytest.mark.parametrize(
+    ("incoming", "forwarded"),
+    [
+        ("/mcp?q=[", "/mcp?x=1&q=["),
+        ("/mcp?q=]", "/mcp?x=1&q=]"),
+        ("/mcp?a[]=1&c=%41", "/mcp?x=1&a[]=1&c=%41"),
+        ("/mcp?q=aZ09-._~!$&'()*+,;=:@/?", "/mcp?x=1&q=aZ09-._~!$&'()*+,;=:@/?"),
+        ("/mcp?q=%", "/mcp?x=1&q=%"),
+        ("/mcp?q=cafÃ©", "/mcp?x=1&q=caf%C3%A9"),
+        ("/mcp?q=\x01\x7f", "/mcp?x=1&q=%01%7F"),
+        ('/mcp?q={}|^\\"`<>', "/mcp?x=1&q=%7B%7D%7C%5E%5C%22%60%3C%3E"),
+        ("/mcp?y=2#f?z=3#g", "/mcp?x=1&y=2"),
+    ],
+)
+async def test_request_target_reaches_the_local_server(incoming: str, forwarded: str) -> None:
+    async with Upstream(OK) as up:
+        b = Bridge(target_handler(up.origin + "/mcp?x=1"))
+        out = await b.request(post(method="GET", target=incoming))
+        assert out.startswith("HTTP/1.1 200 OK\r\n")
+        assert up.head_lines()[0] == f"GET {forwarded} HTTP/1.1"
+
+
+@pytest.mark.parametrize(
+    ("method", "fields"),
+    [
+        ("TRACE", ""),
+        ("TRACK", ""),
+        ("trace", ""),
+        ("CONNECT", ""),
+        ("POST", "x-nul: a\x00b\r\n"),
+    ],
+)
+async def test_unrepresentable_request_is_400_and_never_forwarded(method: str, fields: str) -> None:
+    async with Upstream(OK) as up:
+        b = Bridge(target_handler(up.origin + "/mcp"))
+        out = await b.request(post("{}", fields=fields, method=method))
+        assert out == (
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+            'Content-Length: 58\r\n\r\n{"error":"request cannot be represented as a web Request"}'
+        )
+        assert up.requests == []
+        assert b.errors == []
+
+
 async def test_502_with_errno_name() -> None:
     res = await target_handler(f"http://127.0.0.1:{free_port()}/mcp")(request())
     assert isinstance(res, ErrorReply)

@@ -186,6 +186,26 @@ async def test_parse_error_reply_to_head_is_head_only() -> None:
     assert out == reply("400 Bad Request", "missing or duplicate Host header", head_only=True)
 
 
+async def test_head_replies_for_a_head_that_never_completes_are_head_only() -> None:
+    """The method comes from the first CRLF-terminated line: 400 incomplete request and 431."""
+    b = Bridge()
+    out = await b.request("HEAD /mcp HTTP/1.1\r\n" + HOST)
+    assert out == reply("400 Bad Request", "incomplete request", head_only=True)
+    b = Bridge()
+    out = await b.request("HEAD /mcp HTTP/1.1\r\n" + HOST + "x-pad: " + "a" * 70_000)
+    assert out == reply(
+        "431 Request Header Fields Too Large", "request head too large", head_only=True
+    )
+    # No complete request line: the body stays.
+    b = Bridge()
+    out = await b.request("HEAD /mcp HTTP/1.1")
+    assert out == reply("400 Bad Request", "incomplete request")
+    # A first line that is not exactly a request line: no method, the body stays.
+    b = Bridge()
+    out = await b.request("HEAD /mcp HTTP/1.1 garbage\r\n" + HOST)
+    assert out == reply("400 Bad Request", "incomplete request")
+
+
 async def test_malformed_body_is_400_and_closes() -> None:
     b = Bridge()
     out = await b.request(post(fields="Transfer-Encoding: chunked\r\n") + "zz\r\n")
@@ -215,29 +235,72 @@ async def test_400_request_cannot_be_represented(fields: str) -> None:
     assert closed_cleanly(b)
 
 
+@pytest.mark.parametrize("method", ["CONNECT", "TRACE", "TRACK", "trace", "Connect"])
+async def test_400_unrepresentable_method_never_reaches_the_handler(method: str) -> None:
+    b = Bridge()
+    out = await b.request(post(method=method))
+    assert out == reply("400 Bad Request", "request cannot be represented as a web Request")
+    assert b.requests == []
+    assert b.errors == []
+    assert closed_cleanly(b)
+
+
 # --- precedence (section 4.4) ----------------------------------------------------------------
 
 OVER_CAP = "x" * 32
 
 
+UNREPRESENTABLE = reply("400 Bad Request", "request cannot be represented as a web Request")
+
+
 @pytest.mark.parametrize(
-    ("state", "target", "body", "expected"),
+    ("state", "method", "target", "body", "expected"),
     [
-        ("available", "/healthz", "", reply("404 Not Found", "not_found")),
-        ("disabled", "/healthz", OVER_CAP, reply("404 Not Found", "not_found")),
-        ("closing", "/mcp/", OVER_CAP, reply("404 Not Found", "not_found")),
-        ("unavailable", "/MCP", "", reply("404 Not Found", "not_found")),
-        ("disabled", "/mcp", OVER_CAP, reply("503 Service Unavailable", "service disabled")),
-        ("closing", "/mcp", OVER_CAP, reply("503 Service Unavailable", "service closing")),
-        ("unavailable", "/mcp", OVER_CAP, reply("503 Service Unavailable", "service unavailable")),
-        ("bogus", "/mcp", "", reply("503 Service Unavailable", "service unavailable")),
-        ("available", "/mcp", OVER_CAP, reply("413 Content Too Large", "request body too large")),
+        ("available", "POST", "/healthz", "", reply("404 Not Found", "not_found")),
+        ("disabled", "POST", "/healthz", OVER_CAP, reply("404 Not Found", "not_found")),
+        ("closing", "POST", "/mcp/", OVER_CAP, reply("404 Not Found", "not_found")),
+        ("unavailable", "POST", "/MCP", "", reply("404 Not Found", "not_found")),
+        ("available", "TRACE", "/other", "", reply("404 Not Found", "not_found")),
+        (
+            "disabled",
+            "POST",
+            "/mcp",
+            OVER_CAP,
+            reply("503 Service Unavailable", "service disabled"),
+        ),
+        ("disabled", "CONNECT", "/mcp", "", reply("503 Service Unavailable", "service disabled")),
+        ("closing", "POST", "/mcp", OVER_CAP, reply("503 Service Unavailable", "service closing")),
+        (
+            "unavailable",
+            "POST",
+            "/mcp",
+            OVER_CAP,
+            reply("503 Service Unavailable", "service unavailable"),
+        ),
+        ("bogus", "POST", "/mcp", "", reply("503 Service Unavailable", "service unavailable")),
+        (
+            "available",
+            "POST",
+            "/mcp",
+            OVER_CAP,
+            reply("413 Content Too Large", "request body too large"),
+        ),
+        (
+            "available",
+            "CONNECT",
+            "/mcp",
+            OVER_CAP,
+            reply("413 Content Too Large", "request body too large"),
+        ),
+        ("available", "trace", "/mcp", "", UNREPRESENTABLE),
     ],
 )
-async def test_precedence_table(state: str, target: str, body: str, expected: str) -> None:
+async def test_precedence_table(
+    state: str, method: str, target: str, body: str, expected: str
+) -> None:
     b = Bridge(state=state, max_body=16)
-    head, _, rest = post(body, target=target).partition("\r\n\r\n")
-    # Rows 2-4 answer from the head alone: the reply is out before any body byte arrives.
+    head, _, rest = post(body, target=target, method=method).partition("\r\n\r\n")
+    # Every row answers from the head alone: the reply is out before any body byte arrives.
     b.feed(head + "\r\n\r\n")
     await settle()
     assert b.text() == expected
@@ -258,6 +321,15 @@ async def test_precedence_413_beats_a_malformed_body() -> None:
     b = Bridge(max_body=4)
     out = await b.request(post(fields="Transfer-Encoding: chunked\r\n") + "5\r\nabcde\r\nzz\r\n")
     assert out == reply("413 Content Too Large", "request body too large")
+
+
+async def test_precedence_a_malformed_body_beats_an_unrepresentable_method() -> None:
+    b = Bridge()
+    out = await b.request(
+        post(fields="Transfer-Encoding: chunked\r\n", method="CONNECT") + "zz\r\n"
+    )
+    assert out == reply("400 Bad Request", "malformed chunk size")
+    assert b.requests == []
 
 
 async def test_conflict_on_arrival_resets_without_reading() -> None:
@@ -369,17 +441,17 @@ async def test_body_cap_counts_decoded_bytes_end_to_end() -> None:
 async def test_request_fields() -> None:
     b = Bridge()
     await b.request(
-        "POST https://other.example/mcp?x=1&y=%41 HTTP/1.0\r\n"
+        "POST https://other.example/mcp?x=1&y=%41&a[]=[ HTTP/1.0\r\n"
         + HOST
         + "Connection: close, x-hop\r\nx-hop: 1\r\nKeep-Alive: 5\r\n"
         + "Expect: 100-continue\r\nmcp-session-id: abc\r\nContent-Length: 2\r\n\r\nhi"
     )
     (req,) = b.requests
     assert req.method == "POST"
-    assert req.url == "https://notes-tester.mcpwarp.test/mcp?x=1&y=%41"
-    assert req.target == "/mcp?x=1&y=%41"
+    assert req.url == "https://notes-tester.mcpwarp.test/mcp?x=1&y=%41&a[]=["
+    assert req.target == "/mcp?x=1&y=%41&a[]=["
     assert req.path == "/mcp"
-    assert req.query == "x=1&y=%41"
+    assert req.query == "x=1&y=%41&a[]=["
     assert req.http_version == "1.0"
     assert req.headers == Headers(
         [("Host", "notes-tester.mcpwarp.test"), ("mcp-session-id", "abc")]

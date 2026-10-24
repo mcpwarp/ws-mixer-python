@@ -39,15 +39,27 @@ from .errors import McpwarpError
 
 RETRY_BASE_MS = 1000
 RETRY_CAP_MS = 30_000
-OVERLOAD_PAUSE_MS = 1000
 UNREGISTER_BUDGET_MS = 2000
 REGISTER_RETRY_PREFIX = "register failed"
 
+HELD_DISABLE = "held_disable"
+"""The detail of a `registered` that a held `disable` follows at once."""
 RetryKind = Literal["register", "overloaded"]
 """Why a register is re-sent: a transient register error, or `OVERLOADED`."""
 ErrorOrigin = Literal["malformed", "register_transient", "register_refusal", "app"]
 """Where a non-fatal `error` came from: an envelope that failed to decode, a transient register
 error (retried), a refusal after an earlier registration (nothing retries it), or an `error` op."""
+
+
+_NOT_ANSWERING_ERRORS = frozenset({AppErrorCode.OVERLOADED, AppErrorCode.CONNECTION_LIMIT})
+"""`error` codes that name no frame; every other code, unknown ones included, answers the
+outstanding frame (MCPWARP.md §2.6 One in flight)."""
+
+
+def _backoff_ms(n: int) -> int:
+    """`min(1000 * 2^(n-1), 30000)` ms for the `n`-th consecutive failure."""
+    exponent = min(n - 1, 32)
+    return min(RETRY_BASE_MS << exponent, RETRY_CAP_MS)
 
 
 class ExposeState(StrEnum):
@@ -104,9 +116,9 @@ class RetryInfo:
 
 
 EmitFn = Callable[[str, object, str | None], None]
-"""`emit(event, payload, detail)`: events registered (Registration), disabled (Disabled), enabled
-(Enabled), conflict (Conflict), error (McpwarpError; detail its ErrorOrigin) and retry
-(RetryInfo; detail its RetryKind)."""
+"""`emit(event, payload, detail)`: events registered (Registration; detail HELD_DISABLE or None),
+disabled (Disabled), enabled (Enabled), conflict (Conflict), error (McpwarpError; detail its
+ErrorOrigin) and retry (RetryInfo; detail its RetryKind)."""
 
 
 class Session:
@@ -139,10 +151,23 @@ class Session:
         self._fatal = fatal
         self._connected = False
         self._sent_register_this_conn = False
+        self._may_hold = False
+        """A `registered` arrived on this connection, or a whole-frame `error` answered its
+        register; with neither, a register dropped by OVERLOADED left nothing to unregister
+        (MCPWARP.md §3.2 Unregister)."""
         self._outstanding: Literal["register", "unregister"] | None = None
         self._transient_failures = 0
+        """Consecutive transient register errors since the last successful reply."""
         self._overloaded_resends = 0
-        """Consecutive OVERLOADED register re-sends since the last successful register."""
+        """Consecutive OVERLOADEDs; any other reply ends the streak (MCPWARP.md §2.6)."""
+        self._register_deferred = False
+        """An `enable` arrived while a register was outstanding: register again once it is
+        answered (one frame in flight, §2.6)."""
+        self._register_ahead = False
+        """close() sent its `unregister` while a register was outstanding: the next reply
+        answers that register, not the `unregister` (frame order, §3.2 Unregister)."""
+        self._held_disables: dict[str, str] = {}
+        """`disable` ids not (yet) known as this service's, with their reason."""
         self._retry_timer: TimerHandle | None = None
         self._overload_timer: TimerHandle | None = None
         self._close_waiter: asyncio.Future[None] | None = None
@@ -156,6 +181,11 @@ class Session:
             return
         self._connected = True
         self._sent_register_this_conn = False
+        self._may_hold = False
+        # The OVERLOADED `n` counts on this connection only (§2.6).
+        self._overloaded_resends = 0
+        # Also after a drain hand-over, which never calls on_disconnect for the old connection.
+        self._held_disables.clear()
         self._cancel_timers()
         if self.taken_over:
             return
@@ -168,7 +198,11 @@ class Session:
             return
         self._connected = False
         self._sent_register_this_conn = False
+        self._may_hold = False
         self._outstanding = None
+        self._register_deferred = False
+        # The next connection's register answer is authoritative.
+        self._held_disables.clear()
         self._cancel_timers()
         if self.state == ExposeState.CLOSING:
             # `unregistered` can no longer arrive.
@@ -177,8 +211,9 @@ class Session:
         if not self.taken_over:
             self.state = ExposeState.CONNECTING
 
-    def on_app(self, body: dict[str, Any]) -> None:
-        """An `app` body from the live connection."""
+    def on_app(self, body: dict[str, Any], *, ended: bool = False) -> None:
+        """An `app` body from the live connection; `ended`: that connection has since ended
+        (decided by connection identity, so a late op is stale even after a new welcome)."""
         if self.state == ExposeState.CLOSED:
             return
         try:
@@ -187,32 +222,59 @@ class Session:
             e.service_name = self.name
             self._emit("error", e, "malformed")
             return
-        if isinstance(env, Registered | Disable | Enable) and not self._connected:
+        if isinstance(env, Registered | Disable | Enable) and (ended or not self._connected):
             # From a connection that has since ended: ignored (MCPWARP.md §2.7, v0.6.3).
             return
         if isinstance(env, Registered):
+            self._may_hold = True
+            names = [s.name for s in env.services] + [e.name for e in env.errors]
+            if self._overload_timer is not None and self.name not in names:
+                # During an OVERLOADED pause an empty `registered` answers nothing: the dropped
+                # frame is not on the wire (MCPWARP.md §2.6 OVERLOADED re-send).
+                return
+            if self._outstanding == "register" or self._register_ahead:
+                # Only a reply answering the outstanding frame resets it (§2.6).
+                self._overloaded_resends = 0
+            # While closing it only settles the register ahead of the `unregister`.
+            self._register_ahead = False
             self._on_registered(env)
+            self._flush_deferred_register()
         elif isinstance(env, Unregistered):
+            # Any `unregistered` resets the transient counter (§3.2); only one answering the
+            # outstanding `unregister` resets the OVERLOADED one (§2.6).
+            self._transient_failures = 0
+            if self._outstanding == "unregister" and self._overload_timer is None:
+                self._overloaded_resends = 0
             # The edge answers with no services when this connection held nothing for the name.
             if self._outstanding == "unregister" or any(s.name == self.name for s in env.services):
                 if self._outstanding == "unregister":
-                    self._outstanding = None
+                    self._settle_slot()
                 self._end_close_wait()
         elif isinstance(env, Disable):
             if self._is_ending() or self.taken_over:
                 return
-            if self.server_id is None or env.id == self.server_id:
-                self.server_id = env.id
+            if self.server_id is not None and env.id == self.server_id:
                 self.state = ExposeState.DISABLED
                 self._emit("disabled", Disabled(self.server_id, env.reason), None)
+            else:
+                # Held, never adopted: `disable` fans out to every connection of the owner, so
+                # an unknown id may be another service's (MCPWARP.md §2.7, T49).
+                self._held_disables[env.id] = env.reason
         elif isinstance(env, Enable):
-            if self._is_ending() or self.taken_over or env.name != self.name:
+            self._held_disables.pop(env.id, None)
+            if self._is_ending() or self.taken_over:
+                return
+            # Keyed by name or by the agent's server id; the id is then adopted (section 2.7).
+            if env.name != self.name and (self.server_id is None or env.id != self.server_id):
                 return
             self.server_id = env.id
             self._emit("enabled", Enabled(env.id), None)
             self.state = ExposeState.REGISTERING
             if self._connected:
-                self._send_register()
+                if self._outstanding == "register":
+                    self._register_deferred = True
+                else:
+                    self._send_register()
         elif isinstance(env, ConflictOp):
             if self.taken_over:
                 return
@@ -224,6 +286,7 @@ class Session:
             self._take_over(Conflict(env.id, env.name, env.reason))
         elif isinstance(env, AppError):
             self._on_app_error(env.code, env.message)
+            self._flush_deferred_register()
 
     def on_replaced(self) -> bool:
         """A ws-mixer drain with reason "replaced": a take-over, like `conflict`.
@@ -248,7 +311,12 @@ class Session:
         """
         if self._is_ending():
             return
-        was_registered = self._connected and self._sent_register_this_conn
+        # A register dropped by OVERLOADED (its re-send pending) is abandoned, never re-sent.
+        register_ahead = self._outstanding == "register" and self._overload_timer is None
+        # Skipped too when every register this connection sent was dropped by OVERLOADED.
+        was_registered = (
+            self._connected and self._sent_register_this_conn and (self._may_hold or register_ahead)
+        )
         self.state = ExposeState.CLOSING
         self._cancel_timers()
         if not was_registered:
@@ -256,6 +324,7 @@ class Session:
         fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._close_waiter = fut
         timer = self._clock.call_later(budget_ms, self._end_close_wait)
+        self._register_ahead = register_ahead
         self._outstanding = "unregister"
         self._send(encode_unregister(self.name), on_fail=self._end_close_wait)
         try:
@@ -278,20 +347,37 @@ class Session:
             return
         svc = next((s for s in env.services if s.name == self.name), None)
         if svc is not None:
-            self._outstanding = None
+            self._settle_slot()
+            # The OVERLOADED counter is reset in on_app, only by a reply to a frame (§2.6).
             self._transient_failures = 0
-            self._overloaded_resends = 0
+            self._clear_retry()
             self.url = svc.url
             self.server_id = svc.id
             self.registration = Registration(svc.url, svc.id, svc.created)
             self.ever_registered = True
+            held = self._held_disables.pop(svc.id, None)
             self.state = ExposeState.REGISTERED
-            self._emit("registered", self.registration, None)
+            # A held `disable` for this id applies with the registration: `registered` then
+            # `disabled`, back to back (MCPWARP.md §5.9 Held `disable`); the detail lets the
+            # tunnel collapse the pair into one snapshot (T50).
+            self._emit("registered", self.registration, None if held is None else HELD_DISABLE)
+            if held is not None and self.state == ExposeState.REGISTERED:
+                self.state = ExposeState.DISABLED
+                self._emit("disabled", Disabled(svc.id, held), None)
             return
         err = next((e for e in env.errors if e.name == self.name), None)
         if err is None:
+            if self._outstanding == "register":
+                # It answers the register without listing the name: re-sent with the transient
+                # backoff (MCPWARP.md §2.3 Empty reply).
+                self._settle_slot()
+                self._schedule_register_retry("INTERNAL: unlisted in reply")
             return
-        self._outstanding = None
+        self._settle_slot()
+        # Any non-transient entry, SERVER_DISABLED and refusals included, is a successful reply
+        # for the transient counter (§3.2 Transient retry).
+        if err.code not in TRANSIENT_REGISTER_ERRORS:
+            self._transient_failures = 0
         if err.code == RegisterErrorCode.SERVER_DISABLED:
             if err.id is not None:
                 self.server_id = err.id
@@ -301,16 +387,7 @@ class Session:
         if err.code in TRANSIENT_REGISTER_ERRORS:
             error = McpwarpError(err.code, err.message, service_name=self.name)
             self._emit("error", error, "register_transient")
-            delay = min(RETRY_BASE_MS * 2 ** min(self._transient_failures, 32), RETRY_CAP_MS)
-            self._transient_failures += 1
-            info = RetryInfo(
-                self._transient_failures,
-                delay,
-                f"{REGISTER_RETRY_PREFIX}: {err.code}: {err.message}",
-            )
-            self._emit("retry", info, "register")
-            self._clear_retry()
-            self._retry_timer = self._clock.call_later(delay, self._on_retry_timer)
+            self._schedule_register_retry(f"{err.code}: {err.message}")
             return
         if not self.ever_registered:
             self._fatal(McpwarpError(err.code, err.message, fatal=True, service_name=self.name))
@@ -319,28 +396,71 @@ class Session:
         refusal = McpwarpError(err.code, err.message, service_name=self.name)
         self._emit("error", refusal, "register_refusal")
 
+    def _schedule_register_retry(self, cause: str) -> None:
+        """§3.2 Transient retry; `cause` is "<CODE>: <message>"."""
+        self._transient_failures += 1
+        delay = _backoff_ms(self._transient_failures)
+        info = RetryInfo(self._transient_failures, delay, f"{REGISTER_RETRY_PREFIX}: {cause}")
+        self._emit("retry", info, "register")
+        self._clear_retry()
+        self._retry_timer = self._clock.call_later(delay, self._on_retry_timer)
+
     def _on_retry_timer(self) -> None:
         self._retry_timer = None
+        # Never fires with a frame outstanding: every register send cancels this timer.
         if not self._is_ending() and not self.taken_over and self._connected:
             self._send_register()
 
+    def _flush_deferred_register(self) -> None:
+        """The `enable` deferred behind an outstanding register, once that one is answered. A
+        scheduled re-send (transient, OVERLOADED) carries it instead."""
+        if not self._register_deferred or self._outstanding is not None:
+            return
+        if self._retry_timer is not None or self._overload_timer is not None:
+            return
+        if self._connected and not self._is_ending() and not self.taken_over:
+            self._send_register()
+
     def _on_app_error(self, code: str, message: str) -> None:
+        if self._register_ahead and code != AppErrorCode.CONNECTION_LIMIT:
+            # It answers the register ahead of close()'s `unregister`, which stays outstanding
+            # (MCPWARP.md §3.2 Unregister); one dropped by OVERLOADED is abandoned.
+            self._register_ahead = False
+            if code == AppErrorCode.OVERLOADED:
+                self._overloaded_resends += 1
+                return
+            self._overloaded_resends = 0
+        elif code not in _NOT_ANSWERING_ERRORS and self._overload_timer is None:
+            # Answers the outstanding frame: the in-flight slot is free (§2.6 One in flight).
+            # During an OVERLOADED pause that frame was dropped already and the slot stays
+            # reserved for its re-send.
+            answered = self._outstanding
+            if answered == "register":
+                self._may_hold = True
+            self._settle_slot()
+            self._overloaded_resends = 0
+            if answered == "unregister":
+                self._end_close_wait()
         if code == AppErrorCode.UNSUPPORTED_VERSION:
             self._fatal(McpwarpError(code, message, fatal=True, service_name=self.name))
             return
         if code == AppErrorCode.OVERLOADED:
-            # Re-send what is outstanding once, after a pause (the Go CLI's OverloadPause).
+            # The outstanding frame was dropped unprocessed: re-send it after 1 s, 2 s, 4 s ...
+            # for every consecutive OVERLOADED (MCPWARP.md §2.6 OVERLOADED re-send). The streak
+            # counts OVERLOADEDs only. The slot stays reserved for the re-send, so nothing else
+            # goes out before it.
             op = self._outstanding
             if op is None or self._overload_timer is not None:
                 return
+            self._overloaded_resends += 1
+            delay = _backoff_ms(self._overloaded_resends)
             self._overload_timer = self._clock.call_later(
-                OVERLOAD_PAUSE_MS, lambda: self._on_overload_timer(op)
+                delay, lambda: self._on_overload_timer(op)
             )
             if op == "register" and not self._is_ending():
-                self._overloaded_resends += 1
                 info = RetryInfo(
                     self._overloaded_resends,
-                    OVERLOAD_PAUSE_MS,
+                    delay,
                     f"{REGISTER_RETRY_PREFIX}: {code}: {message}",
                 )
                 self._emit("retry", info, "overloaded")
@@ -360,6 +480,7 @@ class Session:
     def _take_over(self, conflict: Conflict) -> None:
         self.taken_over = True
         self._outstanding = None
+        self._held_disables.clear()
         # The edge no longer holds the name for this connection: close() has nothing to
         # unregister.
         self._sent_register_this_conn = False
@@ -372,12 +493,16 @@ class Session:
         expose.py then closes the connection at once."""
         self.taken_over = True
         self._outstanding = None
+        self._held_disables.clear()
         self._end_close_wait()
 
     # --- plumbing ----------------------------------------------------------------------------
 
     def _send_register(self) -> None:
         self._outstanding = "register"
+        self._register_deferred = False
+        # A scheduled transient re-send is carried by this one.
+        self._clear_retry()
         self._sent_register_this_conn = True
         self._send(encode_register(self.name, self.kind))
 
@@ -399,12 +524,21 @@ class Session:
         fut.add_done_callback(sent)
 
     def _end_close_wait(self) -> None:
+        self._register_ahead = False
         fut, self._close_waiter = self._close_waiter, None
         if fut is not None and not fut.done():
             fut.set_result(None)
 
     def _is_ending(self) -> bool:
         return self.state in (ExposeState.CLOSING, ExposeState.CLOSED)
+
+    def _settle_slot(self) -> None:
+        """A reply answered the outstanding frame: free the slot and drop a pending OVERLOADED
+        re-send of it, so a later frame is never followed by a stale duplicate."""
+        self._outstanding = None
+        if self._overload_timer is not None:
+            self._overload_timer.cancel()
+            self._overload_timer = None
 
     def _clear_retry(self) -> None:
         if self._retry_timer is not None:

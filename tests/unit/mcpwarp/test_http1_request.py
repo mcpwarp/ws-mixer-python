@@ -19,6 +19,7 @@ from ws_mixer._http1 import (
     parse_request_head,
     percent_encode_target,
     reason_phrase,
+    request_line_method,
     request_path,
 )
 
@@ -59,6 +60,19 @@ def test_parses_a_request_head() -> None:
     )
     assert h.framing == 4
     assert h.consumed == len(raw)
+
+
+@pytest.mark.parametrize(
+    ("buf", "method"),
+    [
+        (b"HEAD /mcp HTTP/1.1\r\nHost: h", "HEAD"),
+        (b"HEAD /mcp HTTP/1.1", None),  # no CRLF yet
+        (b"HEAD /mcp HTTP/1.1 garbage\r\n", None),
+        (b"HE@D /mcp HTTP/1.1\r\n", None),  # not a token
+    ],
+)
+def test_request_line_method(buf: bytes, method: str | None) -> None:
+    assert request_line_method(buf) == method
 
 
 def test_http_1_0_and_optional_whitespace() -> None:
@@ -198,6 +212,7 @@ def test_framing() -> None:
         ("http://h.example?x", "/?x"),
         ("/a/../mcp", "/a/../mcp"),
         ("/m%41p", "/m%41p"),
+        ("/mcp?a[]=1&c=%41", "/mcp?a[]=1&c=%41"),
         ("/café", "/caf%E9"),
         ("/a\x7fb", "/a%7Fb"),
         ("/mcp#frag", "/mcp"),
@@ -211,6 +226,31 @@ def test_target_forms(raw_target: str, target: str) -> None:
 
 def test_percent_encode_target_is_ascii_once() -> None:
     assert percent_encode_target("/a b%20é€#") == "/a%20b%20%E9%E2%82%AC%23"
+
+
+@pytest.mark.parametrize(
+    ("raw", "encoded"),
+    [
+        ("aZ09-._~", "aZ09-._~"),
+        ("!$&'()*+,;=", "!$&'()*+,;="),
+        (":@/?", ":@/?"),
+        ("[]", "[]"),
+        ("a[]=1&c=%41", "a[]=1&c=%41"),
+        ("%41", "%41"),
+        ("%", "%"),
+        ("%e9%zz%", "%e9%zz%"),
+        ("é", "%E9"),
+        ("cafÃ©", "caf%C3%A9"),
+        (" ", "%20"),
+        ("\x01", "%01"),
+        ("\t", "%09"),
+        ("\x7f", "%7F"),
+        ('{}|^\\"`<>', "%7B%7D%7C%5E%5C%22%60%3C%3E"),
+    ],
+)
+def test_percent_encode_target_allowed_set(raw: str, encoded: str) -> None:
+    assert percent_encode_target(raw) == encoded
+    assert percent_encode_target(encoded) == encoded
 
 
 @pytest.mark.parametrize(

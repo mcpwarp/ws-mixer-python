@@ -125,11 +125,12 @@ async def expose(options: ExposeOptions | None = None, /, **kwargs: Any) -> Expo
     validated before anything is dialed (MCPWARP.md section 5.2): TypeError for a wrong type,
     ValueError for a bad value, the offending value never echoed.
 
-    Returns the handle once the service is registered, or refused as disabled (state
-    "disabled", `url` None). Raises McpwarpError (fatal) when the first registration or
-    connection fails for good: the register error's code, UNSUPPORTED_VERSION, UNAUTHORIZED
-    (the transport error as `__cause__`), DISCONNECTED_FATAL, or TAKEN_OVER. Dial failures and
-    transient register errors are retried, reported through `on_retry`, until
+    Returns the handle once the service is registered, or disabled (state "disabled"; `url`
+    None when the register was refused SERVER_DISABLED, set when a held `disable` applied with
+    the registration, MCPWARP.md section 2.7). Raises McpwarpError (fatal) when the first
+    registration or connection fails for good: the register error's code, UNSUPPORTED_VERSION,
+    UNAUTHORIZED (the transport error as `__cause__`), DISCONNECTED_FATAL, or TAKEN_OVER. Dial
+    failures and transient register errors are retried, reported through `on_retry`, until
     `reconnect.max_attempts` runs out.
 
     Cancelling the awaiting task before that closes the client in the background and re-raises
@@ -380,7 +381,8 @@ class ExposeHooks:
     """For create_tunnel(): what it observes of one exposure from its start.
 
     `observe(event, payload, detail)` sees every handle event (also after the handle closed,
-    and the superseded disconnects, detail "superseded"), "retry" (RetryInfo; detail its
+    and the superseded disconnects, detail "superseded"; a "registered" that a held `disable`
+    follows at once, detail "held_disable"), "retry" (RetryInfo; detail its
     RetrySource) and "error" (detail its ErrorOrigin, None for handler, listener and on_retry
     failures). `on_client_close` gets each background client close it may want to await.
     """
@@ -543,7 +545,7 @@ class Exposure:
             if isinstance(payload, BaseException):
                 self._report_error(payload, detail)
         else:
-            self.observe(event, payload, None)
+            self.observe(event, payload, detail)
             self._emit(event, payload)
         if event == "conflict" and not self.finished:
             # A take-over after settling: the handle stays readable, the connection goes now.
@@ -564,10 +566,10 @@ class Exposure:
             raise WsMixerError(ErrorCode.INTERNAL_ERROR, "no live connection")
         return conn.send_app(body)
 
-    def _on_app_from(self, body: dict[str, Any], superseded: bool) -> None:
+    def _on_app_from(self, body: dict[str, Any], superseded: bool, ended: bool = False) -> None:
         # A drained connection's messages after its replacement's welcome are stale.
         if not superseded:
-            self.session.on_app(body)
+            self.session.on_app(body, ended=ended)
 
     def _on_disconnect_from(self, reason: DisconnectReason, superseded: bool) -> None:
         # Decided by connection identity: a drained connection ending once its replacement has

@@ -1,7 +1,7 @@
 {
   "comment": "Checked-in floor on passing (SDK, fixture-or-scenario) cells for this repo's conformance jobs. python-client is the fixture-mode column for this SDK's adapter (client role only; python-server is all SKIP and never floor-checked, so it is omitted). go->python is the pair matrix with ws-mixer-go (at goserver.pin, built with -tags conformance) as server and this SDK as client. The ws-mixer-spec runner enforces a key only when the run produced rows for it and --fixture is left at \"*\". Each floor is the count actually observed passing; raise it as rows land and never lower it.",
   "floors": {
-    "python-client": 24,
+    "python-client": 25,
     "go->python": 10
   }
 }

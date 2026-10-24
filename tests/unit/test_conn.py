@@ -345,6 +345,22 @@ async def test_cancelled_handshake_tears_down(baseline: set[asyncio.Task[Any]]) 
     await finish(h, baseline)
 
 
+async def test_no_inbound_frame_is_applied_after_fail(baseline: set[asyncio.Task[Any]]) -> None:
+    h = new_conn()
+    welcomes: list[Any] = []
+    h.conn.on("welcome", welcomes.append)
+    hs = asyncio.create_task(h.conn.handshake())
+    await settle()
+    h.push(WELCOME)  # queued, not yet read
+    h.conn.fail(ConnError(ErrorCode.NO_ERROR, "closing"))
+    await settle()
+    with pytest.raises(ConnError):
+        await hs
+    assert welcomes == [] and h.conn.welcome is None
+    assert [m["t"] for m in controls(h.ws)] == ["hello", "error"]
+    await finish(h, baseline)
+
+
 @pytest.mark.parametrize(
     "msg",
     [
@@ -436,6 +452,13 @@ async def test_stream_limit_refuses_and_counts(baseline: set[asyncio.Task[Any]])
     resets = [f for f in frames(h.ws) if f.type == FrameType.RESET]
     assert [(f.stream_id, reset_code(f)) for f in resets] == [(3, 8), (5, 8)]
     assert h.conn.stats().refused_opens == 2 and h.conn.live_stream_count() == 1
+    # A refused OPEN still counts in highest_opened, so the drain names it.
+    closing = asyncio.create_task(h.conn.close(grace_ms=0))
+    await settle()
+    await h.clock.advance(0)
+    await closing
+    drain = next(m for m in controls(h.ws) if m["t"] == "drain")
+    assert drain["last_stream_id"] == 5
     await finish(h, baseline)
 
 
@@ -802,7 +825,7 @@ async def test_graceful_close_sequence(baseline: set[asyncio.Task[Any]]) -> None
     assert controls(h.ws)[-1] == {
         "t": "drain",
         "reason": "client_requested",
-        "last_stream_id": 0,
+        "last_stream_id": 1,  # highest_opened (WIRE.md 2.9 Client side of a drain)
         "deadline_ms": 5000,
     }
     h.push(encode_open(3))  # crossed our drain on the wire
@@ -818,6 +841,16 @@ async def test_graceful_close_sequence(baseline: set[asyncio.Task[Any]]) -> None
     assert h.ws.close_calls == [(1000, "client closing")]
     assert await s.wait_closed() == Finished()
     assert h.conn.stats().refused_opens == 1
+    await finish(h, baseline)
+
+
+async def test_graceful_close_drain_without_streams_says_zero(
+    baseline: set[asyncio.Task[Any]],
+) -> None:
+    h = await connect()
+    await h.conn.close()
+    drain = next(m for m in controls(h.ws) if m["t"] == "drain")
+    assert (drain["last_stream_id"], drain["deadline_ms"]) == (0, 5000)
     await finish(h, baseline)
 
 

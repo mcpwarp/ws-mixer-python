@@ -3,9 +3,13 @@
 An edge->agent op decodes (with the section 2.3 defaults), fails with MALFORMED_ENVELOPE, or decodes
 as Unknown (UNSUPPORTED_VERSION / UNKNOWN_OP). A valid register/unregister equals the encoder's
 output, byte for byte on the wire. Invalid agent->edge cases carry the edge's verdict: the agent
-side checks its own name rule and that the decoder ignores a v/op it does not know; SCHEMA_* ones
-are schema-checked only. Every case is also run through mcpwarp.schema.json, which must agree
-with `schema_valid`.
+side checks its own name rule and that the decoder ignores a v/op it does not know. Every other
+case is also run through mcpwarp.schema.json, which must agree with `schema_valid`.
+
+Skipped (MCPWARP.md section 10.6, as clarified for v0.8.1): the encoder comparison of the two
+multi-entry `register` fixtures is host guidance, and an agent->edge case whose only verdict is
+the edge's schema check (SCHEMA_* and TOO_MANY_SERVICES hints) is checker/CI tooling, not an SDK
+assertion. Every multi-service edge->agent case runs through the decoder.
 """
 
 from __future__ import annotations
@@ -38,9 +42,31 @@ from ws_mixer.mcpwarp import (
     is_valid_service_name,
 )
 
-# Floor: the fixture count at spec.pin v0.6.1 (a later spec only adds fixtures).
-MIN_ENVELOPE_FIXTURES = 60
+# The fixture count at spec.pin v0.8.0.
+ENVELOPE_FIXTURES = 68
 AGENT_TO_EDGE = {"register", "unregister"}
+PROFILE_SKIP = "host guidance, §10.6 Fixture status"
+# Section 10.6: multi-entry registers a single-service encoder cannot produce.
+MULTI_SERVICE_SKIPPED = ("valid/register_batch_valid", "valid/register_two_services")
+# Section 10.6's other multi-service envelope cases, which a single-service SDK still runs.
+MULTI_SERVICE_RUN = (
+    "valid/registered_partial_errors",
+    "valid/unregistered_subset",
+    "valid/conflict_per_name",
+)
+SCHEMA_ONLY_SKIP = "schema verdict only, checker/CI tooling, §10.6"
+# Agent->edge cases with no agent-side check: their verdict is the edge's schema check.
+SCHEMA_ONLY = (
+    "invalid/register_batch_101_invalid",
+    "invalid/register_empty_services",
+    "invalid/register_missing_kind",
+    "invalid/register_unknown_kind",
+    "invalid/register_unknown_service_field",
+    "invalid/unregister_empty_services",
+    "invalid/unregister_missing_services",
+    "invalid/unregister_name_wrong_type",
+    "invalid/unregister_with_kind",
+)
 
 _CASES = _cases("mcpwarp/envelope", "**/*.json")
 
@@ -100,8 +126,14 @@ def _expected_decode(m: dict[str, Any]) -> InboundEnvelope:
 
 
 def test_envelope_fixture_count(spec_fixtures: Path) -> None:
-    files = list((spec_fixtures / "mcpwarp" / "envelope").glob("**/*.json"))
-    assert len(files) >= MIN_ENVELOPE_FIXTURES
+    root = spec_fixtures / "mcpwarp" / "envelope"
+    names = {p.relative_to(root).with_suffix("").as_posix() for p in root.glob("**/*.json")}
+    assert len(names) == ENVELOPE_FIXTURES
+    assert len(MULTI_SERVICE_SKIPPED) == 2
+    assert set(MULTI_SERVICE_SKIPPED) <= names
+    assert set(MULTI_SERVICE_RUN) <= names
+    assert len(SCHEMA_ONLY) == 9
+    assert set(SCHEMA_ONLY) <= names
 
 
 def test_envelope_fixture(spec_fixtures: Path, envelope_case: Path, schema: dict[str, Any]) -> None:
@@ -109,6 +141,14 @@ def test_envelope_fixture(spec_fixtures: Path, envelope_case: Path, schema: dict
     op: str = fx["op"]
     m: dict[str, Any] = fx["message"]
     hint: str | None = fx.get("expect", {}).get("error_code")
+
+    name = f"{envelope_case.parent.name}/{envelope_case.stem}"
+    if name in MULTI_SERVICE_SKIPPED:
+        pytest.skip(f"{PROFILE_SKIP}: {name}")
+    if name in SCHEMA_ONLY:
+        assert op in AGENT_TO_EDGE and hint is not None
+        assert hint == "TOO_MANY_SERVICES" or hint.startswith("SCHEMA_"), hint
+        pytest.skip(f"{SCHEMA_ONLY_SKIP}: {name}")
 
     assert fx["schema_valid"] == (envelope_case.parent.name == "valid")
     assert _validator(schema).is_valid(m) == fx["schema_valid"]
@@ -131,9 +171,9 @@ def test_envelope_fixture(spec_fixtures: Path, envelope_case: Path, schema: dict
             assert is_valid_service_name(svc["name"])
         elif hint == "INVALID_NAME":
             assert not is_valid_service_name(m["services"][0]["name"])
-        elif hint in ("UNSUPPORTED_VERSION", "UNKNOWN_OP"):
+        else:
+            assert hint in ("UNSUPPORTED_VERSION", "UNKNOWN_OP"), hint
             assert decode_envelope({"mcpwarp": m}) == Unknown(raw_op=m.get("op"), v=m.get("v"))
-        # Otherwise (SCHEMA_* hints) the verdict is the edge's: the schema check above is all.
         return
 
     if fx["wire_valid"]:

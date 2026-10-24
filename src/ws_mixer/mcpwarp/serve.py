@@ -9,7 +9,9 @@ precedence (section 4.4, first match wins):
 3. the agent is disabled, closing or otherwise unavailable: 503, body not read;
 4. the body is over the cap: 413, read up to the cap;
 5. the body is malformed: 400;
-6. the handler.
+6. the request cannot be represented (a CONNECT, TRACE or TRACK method, an invalid Host, a
+   header value holding NUL, CR or LF): 400, handler not called;
+7. the handler.
 
 Every SDK refusal written while request bytes are still unread drains the rest of the body
 (granting window as it reads) and then CLOSEs; it never RESETs. The request body is always
@@ -43,6 +45,7 @@ from .._http1 import (
     is_token,
     parse_request_head,
     reason_phrase,
+    request_line_method,
     request_path,
 )
 from ..clock import Clock
@@ -57,6 +60,7 @@ MCP_PATH = "/mcp"
 HEAD_DEADLINE_MS = 10_000
 DEFAULT_MAX_REQUEST_BODY_BYTES = 4_194_304
 TAKEN_OVER_MESSAGE = "service taken over by another connection"
+_UNREPRESENTABLE_METHODS = frozenset({"CONNECT", "TRACE", "TRACK"})
 
 _UNAVAILABLE_MESSAGES = MappingProxyType(
     {"disabled": "service disabled", "closing": "service closing"}
@@ -280,7 +284,7 @@ async def _serve(
     except RequestParseError as exc:
         await out.refuse(src, exc.status, exc.message, exc.method or method)
     except _Incomplete:
-        await out.reply(400, "incomplete request", "GET")
+        await out.reply(400, "incomplete request", request_line_method(src.buf) or "GET")
     except WsMixerError:
         # The stream was RESET or the connection lost: nobody to answer.
         return
@@ -329,8 +333,11 @@ async def _read_body(src: _Source, head: RequestHead, max_body: int) -> bytes:
 
 
 def _build_request(head: RequestHead, body: bytes) -> Request | None:
-    """Section 4.6 request -> handler, or None when it cannot be represented: a Host that is
-    not a valid authority, or a forwarded value holding NUL, CR or LF."""
+    """Section 4.6 request -> handler, or None when it cannot be represented (section 4.5): a
+    CONNECT, TRACE or TRACK method, a Host that is not a valid authority, or a forwarded value
+    holding NUL, CR or LF."""
+    if head.method.upper() in _UNREPRESENTABLE_METHODS:
+        return None
     fields = forwardable_request_headers(head.headers)
     if not is_authority(head.host) or has_unrepresentable_value(fields):
         return None
@@ -425,8 +432,8 @@ def _prepare(result: object) -> _Prepared:
     if not _is_status(status) or not hasattr(result, "headers") or not hasattr(result, "body"):
         raise TypeError("handler did not return a response (status, headers, body)")
     assert isinstance(status, int)
-    if not 200 <= status <= 999:
-        raise ValueError(f"response status {status} cannot be sent (1xx are never sent)")
+    if not 200 <= status <= 599:
+        raise ValueError(f"response status {status} cannot be sent (section 4.5: 200..599 only)")
     reason = getattr(result, "reason", None)
     if reason is None or reason == "":
         reason = reason_phrase(status)

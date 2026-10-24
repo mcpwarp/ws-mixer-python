@@ -1,8 +1,8 @@
 # ws-mixer (Python)
 
-Python client SDK for [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.1/docs/WIRE.md):
+Python client SDK for [ws-mixer.v1](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/WIRE.md):
 N independent, flow-controlled byte streams multiplexed over one WebSocket. It also ships the
-mcpwarp layer ([MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.6.1/docs/MCPWARP.md)),
+mcpwarp layer ([MCPWARP.md](https://github.com/mcpwarp/ws-mixer-spec/blob/v0.8.0/docs/MCPWARP.md)),
 which exposes a local MCP server at its public mcpwarp URL.
 
 asyncio only, zero runtime dependencies, Python 3.11+. Nothing happens at import time: no
@@ -21,13 +21,16 @@ Sibling SDKs: [ws-mixer-js](https://github.com/mcpwarp/ws-mixer-js) (canonical n
 
 ## Status
 
-0.1.0, not released yet. Client role only. Pinned to spec **v0.6.1** (`spec.pin`) and
-ws-mixer-go **v0.8.0** (`goserver.pin`) for the pair tests. Rulings the spec session made after
-v0.6.1, which ship in v0.6.2/v0.6.3, are already implemented (integral floats, code-point string
-limits, client drain values, hand-over retire timing, `drain.retry_after_ms` as a floor,
-`hello.meta.client = "sdk-python"`, and more); see [docs/DEVIATIONS.md](docs/DEVIATIONS.md).
+0.1.0, not released yet. Client role only. Pinned to spec **v0.8.0** (`spec.pin`) and
+ws-mixer-go **v0.8.0** (`goserver.pin`) for the pair tests. The rulings the spec session made
+after v0.6.1 (integral floats, code-point string limits, hand-over retire timing,
+`drain.retry_after_ms` as a floor, the tunnel's token provider, and more) are in the pinned spec
+text; what still differs is listed in [docs/DEVIATIONS.md](docs/DEVIATIONS.md). Like every
+SDK since spec v0.8.0 it is single-service (`expose()` and the tunnel, one service per
+connection): it has no multi-service controller.
 
-Every client-side fixture set of the spec passes; see [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
+Every client-side fixture set of the spec passes, minus the multi-service host guidance fixtures
+an SDK runner skips; see [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
 
 ## Install
 

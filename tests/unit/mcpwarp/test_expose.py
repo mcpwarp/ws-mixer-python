@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import gc
+import json
 import logging
 import math
 import platform
@@ -22,7 +23,9 @@ import pytest_asyncio
 
 from ws_mixer import SDK_VERSION
 from ws_mixer.client import DisconnectReason, ReconnectOptions
+from ws_mixer.control import encode_control
 from ws_mixer.errors import ErrorCode, StreamError, WsMixerError
+from ws_mixer.frame import FrameType, decode_frame, encode_data
 from ws_mixer.mcpwarp import (
     Agent,
     Closed,
@@ -40,8 +43,16 @@ from ws_mixer.mcpwarp import (
     expose,
 )
 from ws_mixer.mcpwarp.expose import ExposeHooks, Exposure, validate_options
+from ws_mixer.socket import WebSocketConnection, WebSocketInit
 from ws_mixer.stream import Finished, Reset
-from ws_mixer.testing import EdgeConnection, FakeClock, FakeEdge, settle
+from ws_mixer.testing import (
+    EdgeConnection,
+    FakeClock,
+    FakeConnector,
+    FakeEdge,
+    FakeWebSocket,
+    settle,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -431,13 +442,19 @@ async def test_resolves_disabled_on_server_disabled(baseline: set[asyncio.Task[A
     await finish(env, baseline)
 
 
-async def test_resolves_disabled_on_a_disable_op(baseline: set[asyncio.Task[Any]]) -> None:
+async def test_resolves_disabled_on_a_held_disable_op(baseline: set[asyncio.Task[Any]]) -> None:
+    """A disable for an id not known yet is held, not adopted; the registered bringing that id
+    applies it (MCPWARP.md §2.7, T50)."""
     env = Env()
     env.edge.withhold_registered(NAME)
     await env.edge.start()
     task = env.start()
     await env.edge.wait_for_app("register")
     env.edge.send_app({"mcpwarp": {"v": 1, "op": "disable", "id": "srv_9", "reason": "abuse"}})
+    await settle()
+    assert not task.done()
+    svc = {"name": NAME, "id": "srv_9", "url": env.edge.public_url(NAME)}
+    env.edge.send_app({"mcpwarp": {"v": 1, "op": "registered", "services": [svc]}})
     await settle()
     handle = await asyncio.wait_for(task, 1)
     env.handles.append(handle)
@@ -724,7 +741,7 @@ async def test_on_retry_for_overloaded_counts_1_2_3_and_resets(
         await env.edge.wait_for_app("register", count=n)
         env.edge.app_error("OVERLOADED", "busy")
         await settle()
-        await env.clock.advance(1000)
+        await env.clock.advance(1000 * 2 ** (n - 1))
     handle = await asyncio.wait_for(task, 1)
     env.handles.append(handle)
     env.edge.withhold_registered(NAME)
@@ -735,7 +752,9 @@ async def test_on_retry_for_overloaded_counts_1_2_3_and_resets(
     await settle()
     await env.clock.advance(1000)
     reason = "register failed: OVERLOADED: busy"
-    assert env.retries == [RetryInfo(n, 1000, reason) for n in (1, 2, 3, 1)]
+    # MCPWARP.md §2.6: 1 s, 2 s, 4 s for consecutive OVERLOADEDs; a successful reply resets.
+    expected = ((1, 1000), (2, 2000), (3, 4000), (1, 1000))
+    assert env.retries == [RetryInfo(n, d, reason) for n, d in expected]
     assert state(handle) == ExposeState.REGISTERED
     await finish(env, baseline)
 
@@ -882,6 +901,191 @@ async def test_regression_superseded_app_messages_are_ignored(
     await finish(env, baseline)
 
 
+RAW_WELCOME: dict[str, Any] = {
+    "t": "welcome",
+    "v": 1,
+    "session": "s1",
+    "window": 262_144,
+    "max_streams": 64,
+    "ping_interval": 30_000,
+    "ping_timeout": 90_000,
+}
+
+
+def raw_ctl(msg: dict[str, Any]) -> bytes:
+    return encode_data(0, encode_control(msg))
+
+
+def raw_app(op: str, **fields: Any) -> dict[str, Any]:
+    return {"mcpwarp": {"v": 1, "op": op, **fields}}
+
+
+def raw_registered(server_id: str = "srv_anki") -> dict[str, Any]:
+    url = f"https://{NAME}-tester.mcpwarp.test/mcp"
+    return raw_app("registered", services=[{"name": NAME, "id": server_id, "url": url}])
+
+
+class RawEdge:
+    """expose() over a bare FakeConnector, for ops a closed connection's delivery queue hands
+    over late (`client._deliver_app(old_conn, body)`, what that queue calls when it flushes)."""
+
+    def __init__(self) -> None:
+        self.clock = FakeClock()
+        self.fc = FakeConnector()
+        self.recorded: list[tuple[str, Any]] = []
+        self.handle: ExposeHandle | None = None
+
+    async def start(self) -> tuple[ExposeHandle, FakeWebSocket]:
+        task = asyncio.create_task(
+            expose(
+                token="tok",
+                name=NAME,
+                integration=UUID,
+                url="wss://edge.test/v1/tunnel",
+                web_socket=self.fc,
+                handler=echo,
+                clock=self.clock,
+                random=lambda: 0.5,
+            )
+        )
+        ws = await asyncio.wait_for(self.fc.next_socket(0), 1)
+        ws.open()
+        await settle()
+        ws.push(raw_ctl(RAW_WELCOME))
+        await settle()
+        ws.push(raw_ctl({"t": "app", "body": raw_registered()}))
+        handle = self.handle = await asyncio.wait_for(task, 1)
+        self.recorded = record(handle, "registered", "disabled", "enabled")
+        return handle, ws
+
+    @property
+    def events(self) -> list[str]:
+        return [e for e, _ in self.recorded]
+
+    async def reconnect(self, ws0: FakeWebSocket, *same_burst: bytes) -> FakeWebSocket:
+        ws0.server_close(4002, "internal")
+        await settle()
+        while self.fc.dials < 2:
+            await self.clock.advance(100)
+        ws1 = await asyncio.wait_for(self.fc.next_socket(1), 1)
+        ws1.open()
+        await settle()
+        ws1.push(raw_ctl(RAW_WELCOME))
+        for frame in same_burst:
+            ws1.push(frame)
+        await settle()
+        return ws1
+
+    async def done(self) -> None:
+        assert self.handle is not None
+        closing = asyncio.create_task(self.handle.close())
+        while not closing.done():
+            await self.clock.advance(1000)
+        await closing
+
+
+def raw_app_ops(ws: FakeWebSocket) -> list[str]:
+    out = []
+    for raw in ws.sent:
+        f = decode_frame(raw)
+        if f.type == FrameType.DATA and f.stream_id == 0:
+            m = json.loads(f.payload)
+            if m.get("t") == "app":
+                out.append(m["body"]["mcpwarp"]["op"])
+    return out
+
+
+async def test_a_late_disable_from_an_ended_connection_after_a_new_welcome_is_ignored() -> None:
+    """Decided by connection identity (MCPWARP.md §2.7 Ended connection), not by whether some
+    connection is live now."""
+    rig = RawEdge()
+    handle, ws0 = await rig.start()
+    conn0 = handle.client.current_conn()
+    assert conn0 is not None
+    ws1 = await rig.reconnect(ws0)
+    ws1.push(raw_ctl({"t": "app", "body": raw_registered()}))
+    await settle()
+    handle.client._deliver_app(conn0, raw_app("disable", id="srv_anki", reason="abuse"))
+    await settle()
+    assert state(handle) == ExposeState.REGISTERED and rig.events == ["registered"]
+    await rig.done()
+
+
+async def test_a_late_registered_from_an_ended_connection_is_ignored() -> None:
+    rig = RawEdge()
+    handle, ws0 = await rig.start()
+    conn0 = handle.client.current_conn()
+    assert conn0 is not None
+    ws1 = await rig.reconnect(ws0)
+    assert raw_app_ops(ws1) == ["register"]
+    handle.client._deliver_app(conn0, raw_registered("srv_stale"))
+    await settle()
+    assert state(handle) == ExposeState.REGISTERING and rig.events == []
+    ws1.push(raw_ctl({"t": "app", "body": raw_registered()}))
+    await settle()
+    assert state(handle) == ExposeState.REGISTERED and rig.events == ["registered"]
+    assert handle.server_id == "srv_anki"
+    await rig.done()
+
+
+async def test_a_disable_in_the_same_burst_as_the_new_welcome_applies() -> None:
+    rig = RawEdge()
+    handle, ws0 = await rig.start()
+    disable = raw_ctl({"t": "app", "body": raw_app("disable", id="srv_anki", reason="abuse")})
+    await rig.reconnect(ws0, disable)
+    assert state(handle) == ExposeState.DISABLED and rig.events == ["disabled"]
+    await rig.done()
+
+
+async def test_ops_in_the_same_burst_as_a_welcome_and_close_are_not_delivered() -> None:
+    """CLIENT-SDK.md Handler delivery (v0.8.0, clarified for v0.8.1): a `conflict` behind the
+    welcome of a connection that closes in the same burst never reaches the session (one
+    delivered after its connection ended would still apply, MCPWARP.md §2.7)."""
+    rig = RawEdge()
+    handle, ws0 = await rig.start()
+    ws0.server_close(4002, "internal")
+    await settle()
+    while rig.fc.dials < 2:
+        await rig.clock.advance(100)
+    ws1 = await asyncio.wait_for(rig.fc.next_socket(1), 1)
+    ws1.open()
+    await settle()
+    ws1.push(raw_ctl(RAW_WELCOME))
+    conflict = raw_app("conflict", id="srv_anki", name=NAME, reason="taken_over")
+    ws1.push(raw_ctl({"t": "app", "body": conflict}))
+    ws1.server_close(4002, "internal")
+    await settle()
+    assert state(handle) == ExposeState.CONNECTING
+    while rig.fc.dials < 3:
+        await rig.clock.advance(100)
+    ws2 = await asyncio.wait_for(rig.fc.next_socket(2), 1)
+    ws2.open()
+    await settle()
+    ws2.push(raw_ctl(RAW_WELCOME))
+    ws2.push(raw_ctl({"t": "app", "body": raw_registered()}))
+    await settle()
+    assert state(handle) == ExposeState.REGISTERED and rig.events == ["registered"]
+    await rig.done()
+
+
+async def test_a_held_disable_emits_registered_then_disabled_with_the_url_set() -> None:
+    """MCPWARP.md §5.9 Held `disable`: the public events, back to back, state ending disabled."""
+    rig = RawEdge()
+    handle, ws0 = await rig.start()
+    seen: list[tuple[str, str | None]] = []
+    handle.on("registered", lambda _p: seen.append(("registered", handle.url)))
+    handle.on("disabled", lambda _p: seen.append(("disabled", handle.url)))
+    hold = raw_ctl({"t": "app", "body": raw_app("disable", id="srv_new", reason="abuse")})
+    ws1 = await rig.reconnect(ws0, hold)
+    assert seen == [] and state(handle) == ExposeState.REGISTERING
+    ws1.push(raw_ctl({"t": "app", "body": raw_registered("srv_new")}))
+    await settle()
+    url = f"https://{NAME}-tester.mcpwarp.test/mcp"
+    assert seen == [("registered", url), ("disabled", url)]
+    assert state(handle) == ExposeState.DISABLED and handle.server_id == "srv_new"
+    await rig.done()
+
+
 async def test_regression_drained_end_does_not_flip_state_while_replacement_registers(
     baseline: set[asyncio.Task[Any]],
 ) -> None:
@@ -944,6 +1148,88 @@ async def test_drained_end_before_the_replacement_welcome_is_a_lost_connection(
     await env.clock.advance(1000)
     assert state(handle) == ExposeState.REGISTERED
     assert env.ops() == ["register", "register"] and len(env.edge.upgrades) == 2
+    await finish(env, baseline)
+
+
+class ScriptedReplacement:
+    """Dials the fake edge, except the second dial, which gets the scripted `replacement`."""
+
+    def __init__(self, env: Env) -> None:
+        self.replacement = FakeWebSocket()
+        self.calls = 0
+        self._edge = env.edge
+        self._scripted = FakeConnector([self.replacement])
+
+    async def __call__(self, url: str, init: WebSocketInit) -> WebSocketConnection:
+        self.calls += 1
+        if self.calls == 2:
+            return await self._scripted(url, init)
+        return await self._edge.web_socket(url, init)
+
+    def sent(self) -> list[dict[str, Any]]:
+        out = []
+        for raw in self.replacement.sent:
+            f = decode_frame(raw)
+            if f.type == FrameType.DATA and f.stream_id == 0:
+                out.append(json.loads(f.payload))
+        return out
+
+
+LATE_WELCOME: dict[str, Any] = {
+    "t": "welcome",
+    "v": 1,
+    "session": "late",
+    "window": 262_144,
+    "max_streams": 64,
+    "ping_interval": 30_000,
+    "ping_timeout": 90_000,
+}
+
+
+@pytest.mark.parametrize("hello_sent", [True, False])
+async def test_drain_replaced_during_a_hand_over_abandons_the_replacement(
+    baseline: set[asyncio.Task[Any]], hello_sent: bool
+) -> None:
+    env = Env(random=0)
+    dialer = ScriptedReplacement(env)
+    gate = Gate()
+    handle = await env.expose(handler=gate, web_socket=dialer)
+    welcomes: list[Any] = []
+    handle.client.on("welcome", welcomes.append)
+    old = env.conn()
+    inflight = asyncio.create_task(env.post())
+    await settle()
+    env.edge.drain("rollout")
+    await settle()
+    await env.clock.advance(0)
+    assert dialer.calls == 2 and env.retries == [RetryInfo(0, 0.0, "drain")]
+    replacement = dialer.replacement
+    if hello_sent:
+        replacement.open()
+        await settle()
+        assert [m["t"] for m in dialer.sent()] == ["hello"]
+    old.send_control({"t": "drain", "reason": "replaced", "last_stream_id": 1})
+    await settle()
+    with pytest.raises(WsMixerError):
+        await inflight
+    assert state(handle) == ExposeState.CONFLICT and old.closed
+    assert controls(old)[-1] == "error" and old.controls[-1]["code"] == ErrorCode.NO_ERROR
+    assert "drain" not in controls(old)
+    if hello_sent:
+        assert [m["t"] for m in dialer.sent()] == ["hello", "error"]
+        assert dialer.sent()[-1]["code"] == ErrorCode.NO_ERROR
+        assert [code for code, _ in replacement.close_calls] == [1000]
+        replacement.push(encode_data(0, encode_control(LATE_WELCOME)))
+    else:
+        # Python cancels the connector call; JS, which cannot, closes 1000 on open.
+        assert replacement.dial_cancelled and dialer.sent() == []
+    await settle()
+    await env.clock.advance(120_000)
+    assert welcomes == []
+    assert handle.client.state == "closed" and state(handle) == ExposeState.CONFLICT
+    assert [m["t"] for m in dialer.sent()] == (["hello", "error"] if hello_sent else [])
+    assert dialer.calls == 2 and env.retries == [RetryInfo(0, 0.0, "drain")]
+    assert env.ops() == ["register"]
     await finish(env, baseline)
 
 

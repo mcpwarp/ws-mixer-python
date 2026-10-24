@@ -155,6 +155,33 @@ def test_malformed(env: dict[str, Any], message: str) -> None:
     assert info.value.fatal is False
 
 
+@pytest.mark.parametrize(
+    ("service", "message"),
+    [
+        ({"name": 7, "url": "", "created": "yes"}, "registered.services[].name must be a string"),
+        (
+            {"name": "a", "id": 7, "url": "", "created": "yes"},
+            "registered.services[].id must be a string",
+        ),
+        (
+            {"name": "a", "id": "i", "url": "", "created": "yes"},
+            "registered.services[].url must be a non-empty string",
+        ),
+        (
+            {"name": "a", "id": "i", "url": "https://a", "created": "yes"},
+            "registered.services[].created must be a boolean",
+        ),
+    ],
+)
+def test_a_multi_defect_service_reports_the_first_in_name_id_url_created_order(
+    service: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(McpwarpError) as info:
+        _decode({"v": 1, "op": "registered", "services": [service]})
+    assert info.value.code == "MALFORMED_ENVELOPE"
+    assert str(info.value) == message
+
+
 def test_url_missing_in_any_entry_rejects_the_whole_message() -> None:
     env = {
         "v": 1,

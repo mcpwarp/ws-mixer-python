@@ -117,8 +117,8 @@ class Response:
 
     `Content-Length` is sent only when `headers` declares one; otherwise a body is sent chunked,
     one chunk per item of an async iterable body, each written as soon as it is produced. A
-    `None` body is an empty one. `reason` defaults to the RFC 9110 phrase. A 1xx status is not
-    a response (the agent never sends one) and is answered 500 like any other non-response.
+    `None` body is an empty one. `reason` defaults to the RFC 9110 phrase. A status outside
+    200..599 (a 1xx is never sent) is answered 500 like any other non-response (section 4.5).
     """
 
     status: int

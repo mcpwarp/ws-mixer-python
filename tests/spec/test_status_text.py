@@ -3,6 +3,10 @@
 The shipped tables must equal the per-locale JSON string for string, every cases.json input must
 describe exactly as expected, and rules.json must match the resolution order and colon joiners.
 status_text.py keeps its own tables (no file reads at runtime); this is what keeps them in sync.
+
+Per section 10.6 Fixture status it compares only the `<state>.<CODE>` keys: the seven
+multi-service keys (`rules.json` `hostOnly`, optional in an SDK's tables and not in ours) must be
+present in every spec locale file but are not rendered, and the `hostOnlyCases` are skipped.
 """
 
 from __future__ import annotations
@@ -19,9 +23,36 @@ from ws_mixer._jscompat import JS_WHITESPACE
 from ws_mixer.mcpwarp import STATUS_LOCALES, TunnelStatusCode, describe_status
 from ws_mixer.mcpwarp.status_text import _JOINERS, _TABLES
 
-# Floors at spec.pin v0.6.1: six locale tables plus cases.json and rules.json; 26 cases.
-MIN_STATUS_TEXT_FILES = 8
-MIN_CASES = 26
+# Counts at spec.pin v0.8.0: six locale tables plus cases.json and rules.json; 37 cases.
+STATUS_TEXT_FILES = 8
+CASES = 37
+PROFILE_SKIP = "host guidance, §10.6 Fixture status"
+MULTI_SERVICE_KEYS = frozenset(
+    {
+        "service.pending",
+        "service.active",
+        "service.disabled",
+        "service.rejected",
+        "service.taken_over",
+        "service.unregistered",
+        "lastError.NO_SERVICE_REGISTERED",
+    }
+)
+# Section 10.6: describeServiceStatus cases and the NO_SERVICE_REGISTERED rule (by test id).
+MULTI_SERVICE_CASES = (
+    "multi-service-group-fatal-first-reply-mcpwarp-md-6a-9-error-",
+    "the-same-group-status-in-ja",
+    "describeservicestatus-input-service-rejected-conflict-shows-",
+    "describeservicestatus-rejected-forbidden-shows-the-error-una",
+    "describeservicestatus-rejected-by-a-whole-frame-too-many-ser",
+    "describeservicestatus-disabled-in-the-dashboard-code-disable",
+    "describeservicestatus-locally-disabled-no-code-has-no-detail",
+    "describeservicestatus-taken-over-has-no-detail-even-with-its",
+    "describeservicestatus-active-locale-zh-resolves-to-zh-cn-url",
+    "describeservicestatus-pending-with-no-locale-option-is-en",
+    "describeservicestatus-an-unknown-state-is-shown-as-its-own-s",
+)
+NO_SERVICE_REGISTERED = "No service could be registered."
 
 
 def _collect_cases() -> list[dict[str, Any]]:
@@ -50,6 +81,14 @@ def _table(spec_fixtures: Path, locale: str) -> dict[str, dict[str, str]]:
     return {k: v for k, v in data.items() if not k.startswith(("_", "$"))}
 
 
+def _pair_table(spec_fixtures: Path, locale: str) -> dict[str, dict[str, str]]:
+    """The `<state>.<CODE>` keys of a locale file, after checking that it has every
+    multi-service key."""
+    table = _table(spec_fixtures, locale)
+    assert MULTI_SERVICE_KEYS <= table.keys(), locale
+    return {k: v for k, v in table.items() if k not in MULTI_SERVICE_KEYS}
+
+
 @pytest.fixture(scope="module")
 def rules(spec_fixtures: Path) -> dict[str, Any]:
     out: dict[str, Any] = _load(spec_fixtures, "rules.json")
@@ -64,7 +103,7 @@ def _js_replace(s: str, rewrite: dict[str, str]) -> str:
 
 def test_status_text_file_count(spec_fixtures: Path) -> None:
     files = list((spec_fixtures / "mcpwarp" / "status-text").glob("*.json"))
-    assert len(files) >= MIN_STATUS_TEXT_FILES
+    assert len(files) == STATUS_TEXT_FILES
 
 
 def test_locales_match_rules(rules: dict[str, Any]) -> None:
@@ -77,9 +116,9 @@ def test_locales_match_rules(rules: dict[str, Any]) -> None:
 
 @pytest.mark.parametrize("locale", STATUS_LOCALES)
 def test_locale_table(spec_fixtures: Path, rules: dict[str, Any], locale: str) -> None:
-    table = _table(spec_fixtures, locale)
-    assert sorted(table) == sorted(_table(spec_fixtures, "en"))
+    assert sorted(_table(spec_fixtures, locale)) == sorted(_table(spec_fixtures, "en"))
     key_re = re.compile(rules["keyFormat"]["pattern"])
+    table = _pair_table(spec_fixtures, locale)
     for key, want in table.items():
         assert key_re.search(key), key
         state, code = key.split(".")
@@ -98,7 +137,7 @@ def test_locale_table(spec_fixtures: Path, rules: dict[str, Any], locale: str) -
 def test_derived_tables_equal_shipped(spec_fixtures: Path, locale: str) -> None:
     """rules.json keyFormat: states[state] = the label of every <state>.* key; codes[code] = the
     sentence (detail or label) of every *.<code> key."""
-    table = _table(spec_fixtures, locale)
+    table = _pair_table(spec_fixtures, locale)
     states: dict[str, str] = {}
     codes: dict[str, str] = {}
     for key, v in table.items():
@@ -137,7 +176,11 @@ def test_joiner_code_points(rules: dict[str, Any]) -> None:
 
 
 def test_new_in_spec(spec_fixtures: Path, rules: dict[str, Any]) -> None:
+    multi_service = [e for e in rules["newInSpec"] if e.split(":")[1] in MULTI_SERVICE_KEYS]
+    assert len(multi_service) == len(STATUS_LOCALES) * len(MULTI_SERVICE_KEYS)
     for entry in rules["newInSpec"]:
+        if entry in multi_service:
+            continue
         locale, key = entry.split(":")
         state, code = key.split(".")
         got = describe_status({"state": state, "code": code}, locale=locale).to_dict()
@@ -150,7 +193,16 @@ def test_host_off_pattern(rules: dict[str, Any]) -> None:
 
 
 def test_case_count(spec_fixtures: Path) -> None:
-    assert len(_load(spec_fixtures, "cases.json")["cases"]) >= MIN_CASES
+    cases = _load(spec_fixtures, "cases.json")["cases"]
+    assert len(cases) == CASES
+    # The allow-list is exactly the cases section 10.6 has a single-service SDK skip.
+    multi = [
+        _slug(c["description"])
+        for c in cases
+        if "service" in c["input"] or c["input"]["status"].get("lastError") == NO_SERVICE_REGISTERED
+    ]
+    assert len(MULTI_SERVICE_CASES) == 11
+    assert sorted(multi) == sorted(MULTI_SERVICE_CASES)
 
 
 @pytest.mark.parametrize(
@@ -159,6 +211,9 @@ def test_case_count(spec_fixtures: Path) -> None:
     ids=[_slug(c["description"]) for c in _CASES] or ["spec-unavailable"],
 )
 def test_case(spec_fixtures: Path, case: Any) -> None:
+    case_id = _slug(case["description"])
+    if case_id in MULTI_SERVICE_CASES:
+        pytest.skip(f"{PROFILE_SKIP}: {case_id}")
     inp = case["input"]
     assert set(inp) <= {"status", "locale"}, case["description"]
     if inp["locale"] is None:

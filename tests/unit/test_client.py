@@ -285,7 +285,8 @@ async def test_401_provider_refreshes_once_then_fatal(baseline: set[asyncio.Task
     assert refresh == [False, True]
     assert h.delays == [(1, 0, "token-refresh")]
     assert h.fc.dials == 2
-    [r] = h.reports
+    first, r = h.reports
+    assert not first.fatal and first.http_status == 401
     assert r.fatal and r.http_status == 401
     assert not token_refresh_requested()
     await finish(h, baseline)
@@ -303,7 +304,8 @@ async def test_4011_before_welcome_refreshes_then_succeeds(
     await h.welcome(1)
     assert h.start_task is not None and h.start_task.done()
     assert h.delays == [(1, 0, "token-refresh")]
-    assert h.reports == []
+    [r] = h.reports
+    assert (r.phase, r.fatal, r.ws_code, r.error_name) == ("handshake", False, 4011, "UNAUTHORIZED")
     await finish(h, baseline)
 
 
@@ -548,6 +550,68 @@ async def test_connected_close_policy(
     await finish(h, baseline)
 
 
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"t": "app", "body": {"x": 1}},
+        {"t": "drain", "reason": "rollout", "last_stream_id": 0, "retry_after_ms": 5000},
+    ],
+    ids=["app", "drain"],
+)
+async def test_welcome_and_close_in_one_burst_delivers_nothing_queued_behind_the_welcome(
+    baseline: set[asyncio.Task[Any]], frame: dict[str, Any]
+) -> None:
+    """CLIENT-SDK.md Handler delivery (v0.8.0, clarified for v0.8.1): no frame of that burst
+    reaches the app, a drain included, and the retry is the connected-phase one, neither the
+    handshake path nor the drain's. The connected report before it is allowed (Disconnect
+    reason shape)."""
+    h = Harness()
+    apps: list[object] = []
+    drains: list[object] = []
+    h.client.on("app", apps.append)
+    h.client.on("drain", drains.append)
+    t = h.start()
+    ws = await h.sock(0)
+    ws.open()
+    await settle()
+    ws.push(ctl(WELCOME))
+    ws.push(ctl(frame))
+    ws.server_close(4012, "bye")
+    await settle()
+    assert apps == [] and drains == [] and h.client.current_conn() is None
+    [r] = h.reports
+    assert (r.phase, r.fatal, r.ws_code) == ("connected", False, 4012)
+    assert h.delays == [(1, 1000, "going_away")]
+    await h.clock.advance(1000)
+    await h.welcome(1)
+    await t
+    assert h.client.state == "connected"
+    await finish(h, baseline)
+
+
+async def test_frames_right_behind_the_welcome_are_delivered_on_the_current_conn(
+    baseline: set[asyncio.Task[Any]],
+) -> None:
+    """CLIENT-SDK.md Handler delivery (v0.8.0): queued, not dropped, and delivered once the
+    connection is current; a drain there is a hand-over, not a stale frame."""
+    h = Harness()
+    seen: list[tuple[str, bool]] = []
+    h.client.on("app", lambda _b: seen.append(("app", h.client.current_conn() is not None)))
+    h.client.on("drain", lambda _d: seen.append(("drain", h.client.current_conn() is not None)))
+    t = h.start()
+    ws = await h.sock(0)
+    ws.open()
+    await settle()
+    ws.push(ctl(WELCOME))
+    ws.push(ctl({"t": "app", "body": {"x": 1}}))
+    ws.push(ctl({"t": "drain", "reason": "rollout", "last_stream_id": 0}))
+    await settle()
+    await t
+    assert seen == [("app", True), ("drain", True)]
+    assert h.delays == [(0, 1000, "drain")]
+    await finish(h, baseline)
+
+
 async def test_4010_after_welcome_is_fatal(baseline: set[asyncio.Task[Any]]) -> None:
     h = Harness()
     ws = await started(h)
@@ -732,6 +796,26 @@ async def test_drain_retry_after_is_a_floor_under_the_jitter(
     assert h.fc.dials == 1
     await h.clock.advance(1)
     await h.welcome(1)
+    await finish(h, baseline)
+
+
+@pytest.mark.parametrize("hint", ["2147483648", "1000000000000", "1" + "0" * 399])
+async def test_a_huge_drain_retry_after_is_capped_at_the_js_timer_maximum(
+    baseline: set[asyncio.Task[Any]], hint: str
+) -> None:
+    """The hint and the total are clamped to 2^31-1 ms, as in JS; a 400-digit JSON integer
+    neither raises nor leaves the client without a replacement."""
+    h = Harness()
+    drains: list[Any] = []
+    errors: list[Any] = []
+    h.client.on("drain", drains.append)
+    h.client.on("handler_error", errors.append)
+    ws = await started(h)
+    raw = '{"t":"drain","reason":"rollout","last_stream_id":0,"retry_after_ms":' + hint + "}"
+    ws.push(encode_data(0, raw.encode()))
+    await settle()
+    assert h.delays == [(0, 2**31 - 1, "drain")]
+    assert len(drains) == 1 and errors == []
     await finish(h, baseline)
 
 
@@ -989,6 +1073,45 @@ async def test_close_during_a_cooperative_dial_resolves_at_once(
     await settle()
     assert closing.done() and ws.dial_cancelled
     await closing
+    await finish(h, baseline)
+
+
+@pytest.mark.parametrize("how", ["close", "close_now"])
+@pytest.mark.parametrize("outcome", ["resolves", "unavailable", "fails"])
+async def test_close_while_the_token_provider_is_pending_never_dials(
+    baseline: set[asyncio.Task[Any]], how: str, outcome: str
+) -> None:
+    gate: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+    async def provider() -> str:
+        # Ignores close()'s cancel, like a JS promise: the outcome reaches the client late.
+        try:
+            return await asyncio.shield(gate)
+        except asyncio.CancelledError:
+            return await gate
+
+    h = Harness(token=provider)
+    events: list[object] = []
+    for event in ("error", "reconnecting", "close"):
+        h.client.on(event, events.append)
+    h.start()
+    await settle()
+    closing = asyncio.create_task(h.client.close() if how == "close" else h.client._close_now())
+    await settle()
+    if outcome == "resolves":
+        gate.set_result("late-token")
+    elif outcome == "unavailable":
+        gate.set_exception(TokenUnavailableError("still down"))
+    else:
+        gate.set_exception(RuntimeError("provider broke"))
+    await asyncio.wait_for(closing, 1)
+    with pytest.raises(WsMixerError) as ei:
+        assert h.start_task is not None
+        await asyncio.wait_for(h.start_task, 1)
+    assert ei.value.message == "closed before the first connection completed"
+    await h.clock.advance(60_000)
+    assert h.fc.dials == 0
+    assert (h.reports, h.retries, h.fatals, events) == ([], [], [], [])
     await finish(h, baseline)
 
 

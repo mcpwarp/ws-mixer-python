@@ -9,11 +9,16 @@ connection's `register`, answers `ping` with `pong`, and answers `unregister` wi
 unanswered). After every event the loop runs until idle and zero-delay timers have fired; only
 `retry` and `tick` move the clock. Every `disconnect` event also checks the `fatal` verdict the
 SDK itself reached for that close against the fixture's (a spy on the exposure's disconnect
-hook).
+hook). The same spy gives the `post-disconnect-delivery` runnerRequirement: a disconnect's
+`flush_after` ops reach the exposure's app hook right after the SDK has reported that close,
+as the client's delivery queue would hand them over. In a fixture with a `token_provider` event
+every token is a provider whose calls take the queued results.
 
 At the end: every configure/stop/dispose call has finished, the primary listener's snapshots
 (plus each `subscribe` event's one) equal `expect` exactly as `TunnelStatus.to_dict()`, the
 connector was called `expectDials` times, and after a final dispose nothing is left running.
+
+The `ms_*` group fixtures are skipped: host guidance (MCPWARP.md section 10.6 Fixture status).
 """
 
 from __future__ import annotations
@@ -45,8 +50,26 @@ from ws_mixer.mcpwarp.expose import Exposure
 from ws_mixer.socket import WebSocketInit
 from ws_mixer.testing import FakeClock, FakeConnector, FakeWebSocket
 
-# Floor: the fixture count at spec.pin v0.6.1 (01-35 without 33; a later spec only adds).
-MIN_TUNNEL_FIXTURES = 34
+# The fixture count at spec.pin v0.8.0: 01-45 without 33, plus ms_01-ms_14.
+TUNNEL_FIXTURES = 58
+PROFILE_SKIP = "host guidance, §10.6 Fixture status"
+# Section 10.6: group fixtures for the multi-service controller (section 6A).
+MULTI_SERVICE_SKIPPED = (
+    "ms_01_batch_all_ok",
+    "ms_02_partial_errors",
+    "ms_03_too_many_services_whole_frame",
+    "ms_04_overloaded_resend_backoff",
+    "ms_05_conflict_per_name",
+    "ms_06_dashboard_disable_enable",
+    "ms_07_subset_add_remove",
+    "ms_08_reconnect_reregisters_full_list",
+    "ms_09_fatal_first_reply",
+    "ms_10_server_disabled_only_first_reply",
+    "ms_11_first_reply_disabled_and_refused_not_fatal",
+    "ms_12_overloaded_reserved_slot_fold_in",
+    "ms_13_transient_then_overloaded_separate_counters",
+    "ms_14_overloaded_all_removed_no_resend",
+)
 INTEGRATION = "0f6c2a8e-4c1b-4b7e-9a4e-2f1d9b7c3a10"
 WELCOME = {
     "t": "welcome",
@@ -57,6 +80,11 @@ WELCOME = {
     "ping_interval": 3_600_000,
     "ping_timeout": 7_200_000,
 }
+
+# Error codes that name no frame; every other one answers the outstanding frame (§2.6).
+NOT_ANSWERING_ERRORS = {"OVERLOADED", "CONNECTION_LIMIT"}
+EDGE_MESSAGES = ("registered", "register_error", "app_error", "disabled", "enabled", "conflict")
+SUPPORTED_REQUIREMENTS = {"post-disconnect-delivery"}
 
 _CASES = _cases("mcpwarp/tunnel", "*.json")
 
@@ -146,6 +174,10 @@ class Runner:
         self.snapshots: list[dict[str, str]] = []
         self.calls: list[asyncio.Task[None]] = []
         self.overloaded_attempt = 0
+        self.flushed: list[dict[str, Any]] = []
+        """`disconnect.flush_after` app bodies, delivered once the SDK reports that close."""
+        self.retry_after_ms: int | None = None
+        """The last drain's retry_after_ms, a floor for the next `retry {cause: "drain"}`."""
         # A fixture with a `token_provider` event configures a provider in place of each
         # non-blank token (one per token string, so idempotence is unchanged); each call takes
         # the next queued result, "ok" when none is queued.
@@ -246,46 +278,15 @@ class Runner:
                 self.sock(payload).reject(status)
         elif kind == "welcome":
             self.sock(payload).control(dict(WELCOME))
-        elif kind == "registered":
+        elif kind in EDGE_MESSAGES:
             s = self.sock(payload)
-            for svc in payload["services"]:
-                self.server_ids[self.name_of(s)] = svc["id"]
-            services = [{"name": self.name_of(s), **svc} for svc in payload["services"]]
-            s.app({"op": "registered", "services": services})
-            self.overloaded_attempt = 0
-        elif kind == "register_error":
-            s = self.sock(payload)
-            entry: dict[str, Any] = {"name": self.name_of(s), "code": payload["code"]}
-            if "message" in payload:
-                entry["message"] = payload["message"]
-            if "id" in payload:
-                entry["id"] = payload["id"]
-                self.server_ids[self.name_of(s)] = payload["id"]
-            s.app({"op": "registered", "errors": [entry]})
-        elif kind == "app_error":
-            body: dict[str, Any] = {"op": "error", "code": payload["code"]}
-            if "message" in payload:
-                body["message"] = payload["message"]
-            self.sock(payload).app(body)
-        elif kind == "disabled":
-            s = self.sock(payload)
-            body = {"op": "disable", "id": self.server_id(s)}
-            if "reason" in payload:
-                body["reason"] = payload["reason"]
-            s.app(body)
-        elif kind == "enabled":
-            s = self.sock(payload)
-            s.app({"op": "enable", "id": self.server_id(s), "name": self.name_of(s)})
-        elif kind == "conflict":
-            s = self.sock(payload)
-            body = {"op": "conflict", "id": self.server_id(s), "name": self.name_of(s)}
-            if "reason" in payload:
-                body["reason"] = payload["reason"]
-            s.app(body)
+            s.app(self.edge_op(kind, payload, s))
         elif kind == "disconnect":
             await self.disconnect(ev, payload)
         elif kind == "drain":
             msg = {"t": "drain", "reason": payload.get("reason", "rollout"), "last_stream_id": 0}
+            if "retry_after_ms" in payload:
+                msg["retry_after_ms"] = self.retry_after_ms = payload["retry_after_ms"]
             self.sock(payload).control(msg)
         elif kind == "hold":
             self.sock(payload).hold()
@@ -302,6 +303,45 @@ class Runner:
             raise AssertionError(f"unknown fixture event {kind}")
         await self.settle()
 
+    def edge_op(self, kind: str, payload: dict[str, Any], s: EdgeSocket) -> dict[str, Any]:
+        """The mcpwarp op the edge sends on `s` for an edge-message event."""
+        body: dict[str, Any]
+        if kind == "registered":
+            for svc in payload["services"]:
+                self.server_ids[self.name_of(s)] = svc["id"]
+            services = [{"name": self.name_of(s), **svc} for svc in payload["services"]]
+            self.overloaded_attempt = 0
+            return {"op": "registered", "services": services}
+        if kind == "register_error":
+            self.overloaded_attempt = 0  # any reply but OVERLOADED ends the streak (v0.7.1)
+            entry: dict[str, Any] = {"name": self.name_of(s), "code": payload["code"]}
+            if "message" in payload:
+                entry["message"] = payload["message"]
+            if "id" in payload:
+                entry["id"] = payload["id"]
+                self.server_ids[self.name_of(s)] = payload["id"]
+            return {"op": "registered", "errors": [entry]}
+        if kind == "app_error":
+            if payload["code"] not in NOT_ANSWERING_ERRORS:
+                self.overloaded_attempt = 0
+            body = {"op": "error", "code": payload["code"]}
+            if "message" in payload:
+                body["message"] = payload["message"]
+            return body
+        if kind == "disabled":
+            body = {"op": "disable", "id": payload.get("id", self.server_id(s))}
+        elif kind == "enabled":
+            return {"op": "enable", "id": self.server_id(s), "name": self.name_of(s)}
+        else:
+            body = {"op": "conflict", "id": self.server_id(s), "name": self.name_of(s)}
+        if "reason" in payload:
+            body["reason"] = payload["reason"]
+        return body
+
+    def take_flushed(self) -> list[dict[str, Any]]:
+        flushed, self.flushed = self.flushed, []
+        return flushed
+
     async def disconnect(self, ev: dict[str, Any], payload: dict[str, Any]) -> None:
         """README "disconnect.fatal": the SDK's own verdict for this close must equal the
         fixture's. A connection the SDK closed before the event (a retired drained one, or a
@@ -309,6 +349,9 @@ class Runner:
         s = self.sock(payload)
         closed_by_sdk = s.closed or s.aborted
         before = None if self.verdicts is None else len(self.verdicts)
+        for inner in payload.get("flush_after", ()):
+            ((kind, op),) = inner.items()
+            self.flushed.append({"mcpwarp": {"v": 1, **self.edge_op(kind, op, s)}})
         s.disconnect(payload.get("wsCode"))
         if self.verdicts is None or before is None:
             return
@@ -338,6 +381,13 @@ class Runner:
             assert info.attempt == self.overloaded_attempt, f"{what}: attempt {info.attempt}"
         elif cause == "drain":
             assert (info.attempt, reason) == (0, "drain"), f"{what}: {info}"
+            assert self.retry_after_ms is None or info.delay_ms >= self.retry_after_ms, (
+                f"{what}: delay {info.delay_ms} < retry_after_ms {self.retry_after_ms}"
+            )
+            self.retry_after_ms = None
+        elif cause == "token-refresh":
+            expected = (1, 0, "token-refresh")
+            assert (info.attempt, info.delay_ms, reason) == expected, f"{what}: {info}"
         elif cause in ("dial", "lost"):
             assert reason != "drain" and not reason.startswith("register failed"), (
                 f"{what}: {reason!r}"
@@ -349,14 +399,21 @@ class Runner:
 
 def test_tunnel_fixture_count(spec_fixtures: Path) -> None:
     files = sorted((spec_fixtures / "mcpwarp" / "tunnel").glob("*.json"))
-    assert len(files) >= MIN_TUNNEL_FIXTURES
+    assert len(files) == TUNNEL_FIXTURES
+    assert len(MULTI_SERVICE_SKIPPED) == 14
+    assert set(MULTI_SERVICE_SKIPPED) <= {f.stem for f in files}
 
 
 @pytest.mark.asyncio
 async def test_tunnel_fixture(
     spec_fixtures: Path, tunnel_case: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if tunnel_case.stem in MULTI_SERVICE_SKIPPED:
+        pytest.skip(f"{PROFILE_SKIP}: {tunnel_case.stem}")
     fx = json.loads(tunnel_case.read_text(encoding="utf-8"))
+    requirement = fx.get("runnerRequirement")
+    if requirement is not None and requirement not in SUPPORTED_REQUIREMENTS:
+        pytest.skip(f"runnerRequirement {requirement!r}: not supported by this runner")
     baseline = set(asyncio.all_tasks())
     verdicts: list[bool] = []
     reported = Exposure._on_disconnect_from
@@ -364,6 +421,9 @@ async def test_tunnel_fixture(
     def spy(self: Exposure, reason: DisconnectReason, superseded: bool) -> None:
         verdicts.append(reason.fatal)
         reported(self, reason, superseded)
+        # Post-disconnect delivery: what the client would hand the layer from its queue.
+        for body in runner.take_flushed():
+            self._on_app_from(body, False)
 
     monkeypatch.setattr(Exposure, "_on_disconnect_from", spy)
     runner = Runner(fx, verdicts)

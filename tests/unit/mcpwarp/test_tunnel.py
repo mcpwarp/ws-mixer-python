@@ -22,7 +22,8 @@ import pytest
 
 from tests.spec.test_tunnel import WELCOME, EdgeSocket
 from ws_mixer import TokenUnavailableError, token_refresh_requested
-from ws_mixer.frame import decode_frame
+from ws_mixer.errors import ErrorCode
+from ws_mixer.frame import FrameType, decode_frame, encode_data, encode_open
 from ws_mixer.mcpwarp import (
     Agent,
     Closed,
@@ -567,6 +568,62 @@ async def test_a_stop_during_the_raw_dial_never_shows_the_late_socket() -> None:
     await env.finish()
 
 
+def sent_controls(sock: EdgeSocket) -> list[dict[str, Any]]:
+    out = []
+    for raw in sock.sent:
+        f = decode_frame(raw)
+        if f.type == FrameType.DATA and f.stream_id == 0:
+            out.append(json.loads(f.payload))
+    return out
+
+
+@pytest.mark.parametrize("registered", [True, False])
+@pytest.mark.parametrize("how", ["conflict", "replaced"])
+async def test_a_take_over_closes_at_once_with_no_error_and_1000(
+    registered: bool, how: str
+) -> None:
+    release = asyncio.Event()
+    calls: list[Request] = []
+
+    async def gated(request: Request) -> Response:
+        calls.append(request)
+        await release.wait()
+        return Response(200, body=b"late")
+
+    env = Env(handler=gated)
+    if registered:
+        await env.online()
+        env.sock().push(encode_open(1))
+        env.sock().push(
+            encode_data(1, b"POST /mcp HTTP/1.1\r\nHost: notes-tester.mcpwarp.test\r\n\r\n")
+        )
+        await env.settle()
+        assert len(calls) == 1  # in flight: a graceful close would wait for it
+    else:
+        env.configure(TunnelConfig(True, TOKEN, "notes"))
+        await env.settle()
+        env.sock().open()
+        await env.settle()
+        env.sock().control(dict(WELCOME))
+        await env.settle()
+    sock = env.sock()
+    if how == "conflict":
+        sock.app({"op": "conflict", "id": "srv_notes", "name": "notes", "reason": "taken_over"})
+    else:
+        sock.control({"t": "drain", "reason": "replaced", "last_stream_id": int(registered)})
+    await env.settle()  # no time passes
+    sent = sent_controls(sock)
+    assert sent[-1]["t"] == "error" and sent[-1]["code"] == ErrorCode.NO_ERROR
+    assert "drain" not in [m["t"] for m in sent]
+    assert [m["body"]["mcpwarp"]["op"] for m in sent if m["t"] == "app"] == ["register"]
+    assert [code for code, _ in sock.close_calls] == [1000]
+    assert env.tunnel.status.state == TunnelState.CONFLICT
+    await env.clock.advance(120_000)
+    assert env.connector.dials == 1
+    release.set()
+    await env.finish()
+
+
 # --- dispose() ----------------------------------------------------------------------------------
 
 
@@ -1042,7 +1099,12 @@ async def test_a_rejected_token_gets_one_refresh_retry_then_is_unauthorized(
     assert tokens.refresh == [False, True]
     assert env.retries == [RetryInfo(1, 0, "token-refresh")]
     assert env.connector.dials == 2
-    assert env.snaps[-1] == {"state": "connecting"}
+    # T48: the rejected dial is a failed dial, as T27.
+    assert env.snaps[-1] == {
+        "state": "connecting",
+        "code": "RETRYING",
+        "lastError": "Can't reach mcpwarp; retrying.",
+    }
     if rejection == "close-4011":
         assert hello_token(env.sock(0)) == "tok-stale"
         env.sock().open()

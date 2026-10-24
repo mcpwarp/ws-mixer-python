@@ -6,7 +6,8 @@ blocks until the edge goes away or the response is complete, and yields `http.di
 `http.response.start` is held until the handler returns; each `http.response.body` becomes one
 item of the Response's async body, which the bridge writes as soon as it is produced. The
 hand-off holds at most one chunk, so a slow edge makes the app's `send()` wait. A status below
-200 is not a response: the handler raises and the bridge answers 500 `handler error`.
+200 is not a response: the handler raises and the bridge answers 500 `handler error`; so does
+the bridge for a status of 600 or more (MCPWARP.md section 4.5).
 
 The app task outlives the handler's return: it runs while the bridge reads the body. When the
 bridge stops reading before the response is complete (edge RESET, connection lost, stop), the

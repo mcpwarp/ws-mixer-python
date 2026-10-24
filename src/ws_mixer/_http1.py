@@ -194,11 +194,11 @@ _SCHEME_AUTHORITY = re.compile(r"[a-z][a-z0-9+.-]*://[^/?#]*", re.IGNORECASE)
 _AUTHORITY = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[^\x00-\x20\x7f#/:<>?@\[\\\]^|%]+)(?::([0-9]*))?")
 _DIGITS = re.compile(r"[0-9]+")
 _HEX = re.compile(r"[0-9A-Fa-f]+")
-# RFC 3986 unreserved, sub-delims, ":" "@" (pchar), "/" "?" (query) and "%" (escapes are kept,
-# never decoded). Any other byte of a request target is percent-encoded once; the fragment is cut
-# off before encoding.
+# Section 4.3: RFC 3986 unreserved, sub-delims, ":" "@" "/" "?", "[" "]" (as WHATWG URL leaves
+# them in a query) and "%" (escapes, and a lone "%", are kept, never decoded). Any other byte of a
+# request target is percent-encoded once; the fragment is cut off before encoding.
 _TARGET_SAFE = frozenset(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:@/?%"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:@/?[]%"
 )
 # What a fetch-style Headers object refuses in a value (and what could split a line on the wire).
 _UNREPRESENTABLE_VALUE = re.compile(r"[\x00\r\n]")
@@ -274,7 +274,7 @@ def parse_request_head(buf: bytes | bytearray, *, scan_from: int = 0) -> Request
     end = buf.find(b"\r\n\r\n", max(0, scan_from - 3), MAX_HEAD_SIZE)
     if end < 0:
         if len(buf) >= MAX_HEAD_SIZE:
-            raise RequestParseError(431, "request head too large")
+            raise RequestParseError(431, "request head too large", request_line_method(buf))
         return NEED_MORE
     lines = bytes(buf[:end]).decode("latin-1").split("\r\n")
     m = _REQUEST_LINE.fullmatch(lines[0])
@@ -295,6 +295,16 @@ def parse_request_head(buf: bytes | bytearray, *, scan_from: int = 0) -> Request
         framing=_body_framing(fields, method),
         consumed=end + 4,
     )
+
+
+def request_line_method(buf: bytes | bytearray) -> str | None:
+    """The method of a head that never completed, from its first CRLF-terminated line when
+    that is a well-formed request line, so a reply to HEAD stays head-only."""
+    end = buf.find(b"\r\n", 0, MAX_HEAD_SIZE)
+    if end < 0:
+        return None
+    m = _REQUEST_LINE.fullmatch(bytes(buf[:end]).decode("latin-1"))
+    return m.group(1) if m is not None and is_token(m.group(1)) else None
 
 
 def _parse_target(raw: str, method: str) -> str:

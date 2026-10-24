@@ -203,6 +203,11 @@ A listener that raises does not stop the others: its exception is re-emitted as 
 | `disconnect` | `DisconnectReason` (every transport disconnect) |
 | `close` | `Closed` (once, last) |
 
+When a `disable` for an id the handle did not know yet is held and a later `registered` brings
+that id, the handle emits `registered` then `disabled`, back to back: `url` and `registration`
+are set by then and `state` ends `disabled` (spec §5.9 Held `disable`). A tunnel shows the pair
+as one `disabled` snapshot.
+
 ### Handlers
 
 | Name | Signature | Purpose |

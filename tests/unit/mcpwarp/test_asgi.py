@@ -669,6 +669,45 @@ async def test_e2e_head_to_a_streaming_app_cancels_it() -> None:
     assert b.host.ends() == [("CLOSE", None)]
 
 
+async def test_e2e_brackets_reach_the_scope_unchanged() -> None:
+    rec = Recorder()
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        rec.scope = scope
+        await send({"type": "http.response.start", "status": 204})
+        await send({"type": "http.response.body"})
+
+    b = Bridge(asgi_handler(app))
+    await b.request(http("GET").replace("/mcp", "/mcp?a[]=1&k=[x]", 1))
+    assert rec.scope is not None
+    assert (rec.scope["path"], rec.scope["raw_path"]) == ("/mcp", b"/mcp")
+    assert rec.scope["query_string"] == b"a[]=1&k=[x]"
+    assert b.errors == []
+
+
+@pytest.mark.parametrize(
+    ("method", "fields"), [("CONNECT", ""), ("trace", ""), ("POST", "x-nul: a\x00b\r\n")]
+)
+async def test_e2e_unrepresentable_request_is_400_and_the_app_is_not_called(
+    method: str, fields: str
+) -> None:
+    called: list[bool] = []
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        called.append(True)
+
+    b = Bridge(asgi_handler(app))
+    out = await b.request(http(method, body="{}", fields=fields))
+    body = '{"error":"request cannot be represented as a web Request"}'
+    assert out == (
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n{body}"
+    )
+    assert called == []
+    assert b.host.ends() == [("CLOSE", None)]
+    assert b.errors == []
+
+
 @pytest.mark.parametrize(("status", "reason"), [(204, "No Content"), (304, "Not Modified")])
 async def test_e2e_204_and_304_are_bodyless(status: int, reason: str) -> None:
     b = Bridge(asgi_handler(starlette_app()))

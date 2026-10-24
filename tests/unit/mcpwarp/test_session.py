@@ -136,6 +136,9 @@ async def test_kind_goes_into_register() -> None:
 async def test_other_names_unknown_ops_and_foreign_bodies_are_ignored() -> None:
     r = Rig()
     r.session.on_welcome()
+    r.registered()
+    r.events.clear()
+    # Nothing outstanding: a reply for other names answers nothing of ours.
     r.registered(name="other")
     r.app(op="registered", errors=[{"name": "other", "code": "INVALID_NAME"}])
     r.session.on_app({"not": "ours"})
@@ -143,8 +146,42 @@ async def test_other_names_unknown_ops_and_foreign_bodies_are_ignored() -> None:
     r.session.on_app({"mcpwarp": {"v": 2, "op": "registered"}})
     r.session.on_app({"mcpwarp": {"v": True, "op": "conflict", "id": "srv_anki", "name": "anki"}})
     r.app(op="frobnicate")
-    assert r.state() == ExposeState.REGISTERING
+    assert r.state() == ExposeState.REGISTERED and r.ops() == ["register"]
     assert r.events == [] and r.fatals == []
+    await r.done()
+
+
+async def test_a_registered_not_listing_the_name_is_re_sent_with_the_transient_backoff() -> None:
+    """Spec text at v0.7.1 (MCPWARP.md §2.3 Empty reply): it answers the outstanding register,
+    changes no state, and the register is re-sent after the §3.2 backoff."""
+    r = Rig()
+    r.session.on_welcome()
+    r.registered(name="other")
+    reason = "register failed: INTERNAL: unlisted in reply"
+    assert r.of("retry") == [RetryInfo(1, 1000, reason)] and r.details("retry") == ["register"]
+    assert r.state() == ExposeState.REGISTERING and r.of("error") == []
+    await r.clock.advance(999)
+    assert r.ops() == ["register"]
+    await r.clock.advance(1)
+    assert r.ops() == ["register", "register"]
+    r.app(op="registered")  # no services, no errors
+    assert r.of("retry")[-1] == RetryInfo(2, 2000, reason)
+    await r.clock.advance(2000)
+    r.registered()
+    assert r.state() == ExposeState.REGISTERED and r.ops() == ["register"] * 3
+    await r.done()
+
+
+async def test_a_registered_not_listing_the_name_frees_the_slot() -> None:
+    """It answers the register: an `enable` during the backoff registers at once."""
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="registered")
+    r.app(op="enable", id="srv_anki", name="anki")
+    assert r.ops() == ["register", "register"]
+    r.registered()
+    await r.clock.advance(60_000)
+    assert r.ops() == ["register", "register"] and r.state() == ExposeState.REGISTERED
     await r.done()
 
 
@@ -312,20 +349,40 @@ async def test_overloaded_resend_is_dropped_when_registered_arrives_within_the_p
 
 
 async def test_regression_overloaded_attempt_counts_1_2_3_and_resets_on_success() -> None:
-    """JS bug: the OVERLOADED re-send attempt was always 1."""
+    """JS bug: the OVERLOADED re-send attempt was always 1. Consecutive re-sends back off
+    1 s, 2 s, 4 s (MCPWARP.md §2.6 OVERLOADED re-send)."""
     r = Rig()
     r.session.on_welcome()
-    for _ in range(3):
+    for n in range(3):
         r.overloaded()
-        await r.clock.advance(1000)
+        await r.clock.advance(1000 * 2**n - 1)
+        assert r.ops() == ["register"] * (n + 1)
+        await r.clock.advance(1)
     r.registered()
     r.app(op="disable", id="srv_anki")
     r.app(op="enable", id="srv_anki", name="anki")
     r.overloaded()
     await r.clock.advance(1000)
-    attempts = [i.attempt for i in r.of("retry") if isinstance(i, RetryInfo)]
-    assert attempts == [1, 2, 3, 1]
+    retries = [(i.attempt, i.delay_ms) for i in r.of("retry") if isinstance(i, RetryInfo)]
+    assert retries == [(1, 1000), (2, 2000), (3, 4000), (1, 1000)]
     assert r.ops() == ["register"] * 6
+    await r.done()
+
+
+async def test_overloaded_backoff_caps_at_30s_and_any_non_transient_reply_resets_it() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    for _ in range(7):
+        r.overloaded()
+        await r.clock.advance(30_000)
+    delays = [i.delay_ms for i in r.of("retry") if isinstance(i, RetryInfo)]
+    assert delays == [1000, 2000, 4000, 8000, 16000, 30_000, 30_000]
+    r.reg_error("SERVER_DISABLED", id="srv_anki")
+    r.app(op="enable", id="srv_anki", name="anki")
+    r.overloaded()
+    await r.clock.advance(1000)
+    last = r.of("retry")[-1]
+    assert isinstance(last, RetryInfo) and (last.attempt, last.delay_ms) == (1, 1000)
     await r.done()
 
 
@@ -360,6 +417,483 @@ async def test_unsupported_version_is_fatal_other_error_ops_are_not() -> None:
     await r.done()
 
 
+@pytest.mark.parametrize(
+    "code", ["TOO_MANY_SERVICES", "UNKNOWN_OP", "BAD_REQUEST", "UNSUPPORTED_VERSION", "NEW_CODE"]
+)
+async def test_a_whole_frame_error_answers_the_outstanding_register(code: str) -> None:
+    """MCPWARP.md §2.6 One in flight: any code but OVERLOADED and CONNECTION_LIMIT, unknown
+    ones included, frees the in-flight slot and ends the OVERLOADED streak."""
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    await r.clock.advance(1000)
+    assert r.ops() == ["register", "register"]
+    r.app(op="error", code=code, message="m")
+    assert r.session._outstanding is None
+    # The slot is free: an `enable` registers at once instead of waiting for a reply.
+    r.app(op="enable", id="srv_anki", name="anki")
+    assert r.ops() == ["register"] * 3
+    r.overloaded()
+    retries = [(i.attempt, i.delay_ms) for i in r.of("retry") if isinstance(i, RetryInfo)]
+    assert retries == [(1, 1000), (1, 1000)]
+    await r.clock.advance(1000)
+    assert r.ops() == ["register"] * 4
+    await r.done()
+
+
+@pytest.mark.parametrize("code", ["BAD_REQUEST", "SOMETHING_NEW"])
+async def test_an_error_answering_the_register_sends_the_queued_enable_at_once(code: str) -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="enable", id="srv_anki", name="anki")
+    assert r.ops() == ["register"]
+    r.app(op="error", code=code, message="m")
+    assert r.ops() == ["register", "register"] and not r.session._register_deferred
+    r.registered()
+    assert r.state() == ExposeState.REGISTERED
+    await r.done()
+
+
+async def test_connection_limit_answers_no_frame() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="enable", id="srv_anki", name="anki")
+    r.app(op="error", code="CONNECTION_LIMIT", message="m")
+    assert r.ops() == ["register"] and r.session._register_deferred
+    r.registered()
+    assert r.ops() == ["register", "register"]
+    await r.done()
+
+
+async def test_any_other_reply_ends_the_overloaded_streak() -> None:
+    """Spec text at v0.7.1 (MCPWARP.md §2.6): the OVERLOADED `n` counts consecutive OVERLOADEDs
+    only, so a transient refusal in between starts it over; the transient retry keeps its own
+    §3.2 counter."""
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    await r.clock.advance(1000)
+    r.reg_error("UNAVAILABLE")
+    await r.clock.advance(1000)
+    r.overloaded()
+    await r.clock.advance(1000)
+    r.reg_error("UNAVAILABLE")
+    retries = [(i.attempt, i.delay_ms) for i in r.of("retry") if isinstance(i, RetryInfo)]
+    assert retries == [(1, 1000), (1, 1000), (1, 1000), (2, 2000)]
+    assert r.details("retry") == ["overloaded", "register", "overloaded", "register"]
+    await r.clock.advance(2000)
+    await r.done()
+
+
+async def test_an_enable_during_a_pending_register_waits_for_its_reply() -> None:
+    """Spec text at v0.7.1 (MCPWARP.md §2.6 One in flight): the `enable` is queued, nothing is
+    sent until the outstanding register is answered, then its register goes out."""
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="enable", id="srv_anki", name="anki")
+    assert r.of("enabled") == [Enabled("srv_anki")]
+    assert r.ops() == ["register"]
+    r.registered()
+    assert r.ops() == ["register", "register"]
+    assert r.session._outstanding == "register"
+    r.registered()
+    assert r.ops() == ["register", "register"] and r.state() == ExposeState.REGISTERED
+    await r.done()
+
+    # Answered by a transient refusal: the scheduled re-send carries the deferred register.
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="enable", id="srv_anki", name="anki")
+    r.reg_error("UNAVAILABLE")
+    assert r.ops() == ["register"]
+    await r.clock.advance(1000)
+    assert r.ops() == ["register", "register"]
+    r.registered()
+    assert r.ops() == ["register", "register"]
+    await r.done()
+
+
+async def test_a_register_sent_meanwhile_cancels_the_scheduled_transient_re_send() -> None:
+    """An `enable` registers during the transient backoff: that register carries the re-send,
+    so the old timer must not send another, whatever the answer (here SERVER_DISABLED)."""
+    r = Rig()
+    r.session.on_welcome()
+    r.reg_error("UNAVAILABLE")
+    r.app(op="enable", id="srv_anki", name="anki")
+    assert r.ops() == ["register", "register"]
+    r.reg_error("SERVER_DISABLED", id="srv_anki")
+    await r.clock.advance(60_000)
+    assert r.ops() == ["register", "register"] and r.state() == ExposeState.DISABLED
+    await r.done()
+
+
+async def test_a_successful_registered_cancels_the_scheduled_transient_re_send() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.reg_error("UNAVAILABLE")
+    r.registered()  # a late success during the backoff
+    await r.clock.advance(60_000)
+    assert r.ops() == ["register"] and r.state() == ExposeState.REGISTERED
+    await r.done()
+
+
+async def test_a_reply_within_the_overloaded_pause_drops_the_re_send() -> None:
+    """The edge answered after all; a later register (an `enable`) must not be followed by the
+    stale OVERLOADED re-send."""
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    r.registered()
+    r.app(op="disable", id="srv_anki")
+    r.app(op="enable", id="srv_anki", name="anki")
+    await r.clock.advance(60_000)
+    assert r.ops() == ["register", "register"]
+    await r.done()
+
+
+async def test_a_whole_frame_error_during_the_overloaded_pause_keeps_the_re_send() -> None:
+    """The dropped frame's slot stays reserved: the re-send still goes out instead of leaving
+    the session registering with nothing in flight."""
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    r.app(op="error", code="BAD_REQUEST", message="m")
+    await r.clock.advance(1000)
+    assert r.ops() == ["register", "register"]
+    r.registered()
+    assert r.ops() == ["register", "register"] and r.state() == ExposeState.REGISTERED
+    await r.done()
+
+
+@pytest.mark.parametrize("reply", ["error", "empty"])
+async def test_an_error_or_empty_reply_during_the_overloaded_pause_answers_nothing(
+    reply: str,
+) -> None:
+    """MCPWARP.md §2.6 OVERLOADED re-send (v0.7.2): the re-send and the OVERLOADED counter
+    stay, and no transient re-send is scheduled."""
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    if reply == "error":
+        r.app(op="error", code="UNKNOWN_OP", message="m")
+    else:
+        r.app(op="registered", services=[])
+    await r.clock.advance(1000)
+    assert r.ops() == ["register", "register"]
+    r.overloaded()
+    retries = [(i.attempt, i.delay_ms) for i in r.of("retry") if isinstance(i, RetryInfo)]
+    assert retries == [(1, 1000), (2, 2000)]
+    assert r.details("retry") == ["overloaded", "overloaded"]
+    await r.clock.advance(2000)
+    assert r.ops() == ["register"] * 3
+    r.registered()
+    assert r.state() == ExposeState.REGISTERED
+    await r.done()
+
+
+async def test_a_registered_answering_no_frame_leaves_the_overloaded_counter() -> None:
+    """§2.6 (v0.8.0): while close()'s dropped `unregister` waits for its re-send, a stray
+    `registered` answers nothing, so the next OVERLOADED is n = 2 (2000 ms, the whole budget)."""
+    r = Rig()
+    r.session.on_welcome()
+    r.registered()
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    r.overloaded()  # drops the unregister: n = 1
+    r.registered()
+    await r.clock.advance(1000)
+    assert r.ops() == ["register", "unregister", "unregister"]
+    r.overloaded()  # n = 2: re-sent after 2000 ms, past the budget
+    await r.clock.advance(1000)
+    await settle()
+    assert closing.done() and r.ops() == ["register", "unregister", "unregister"]
+    await r.done()
+
+
+async def test_an_unregistered_during_a_register_pause_leaves_the_overloaded_counter() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    r.app(op="unregistered", services=[])
+    await r.clock.advance(1000)
+    r.overloaded()
+    retries = [(i.attempt, i.delay_ms) for i in r.of("retry") if isinstance(i, RetryInfo)]
+    assert retries == [(1, 1000), (2, 2000)]
+    await r.clock.advance(2000)
+    await r.done()
+
+
+async def test_a_new_connection_starts_a_new_overloaded_counter() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    r.session.on_disconnect()
+    r.session.on_welcome()
+    r.overloaded()
+    retries = [(i.attempt, i.delay_ms) for i in r.of("retry") if isinstance(i, RetryInfo)]
+    assert retries == [(1, 1000), (1, 1000)]
+    await r.clock.advance(1000)
+    await r.done()
+
+
+async def test_a_registered_naming_the_service_during_the_pause_cancels_the_re_send() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    r.registered()
+    await r.clock.advance(1000)
+    assert r.ops() == ["register"] and r.state() == ExposeState.REGISTERED
+    # It answered the register, so the OVERLOADED counter starts over.
+    r.app(op="enable", id="srv_anki", name="anki")
+    r.overloaded()
+    last = r.of("retry")[-1]
+    assert isinstance(last, RetryInfo) and (last.attempt, last.delay_ms) == (1, 1000)
+    await r.clock.advance(1000)
+    await r.done()
+
+
+async def test_a_stray_registered_changes_no_overloaded_counter() -> None:
+    """Nothing outstanding and no pause. Unreachable through inputs (every answer already reset
+    the counter), so the state is forced, to pin that the success path leaves it alone."""
+    r = Rig()
+    r.session.on_welcome()
+    r.registered()
+    r.session._overloaded_resends = 1
+    r.registered()
+    assert r.session._overloaded_resends == 1
+    await r.done()
+
+
+async def test_a_server_disabled_entry_resets_the_transient_counter() -> None:
+    """§3.2 Transient retry: a `registered` with a non-transient entry is a successful reply,
+    so the next transient refusal starts over at attempt 1 / 1000 ms."""
+    r = Rig()
+    r.session.on_welcome()
+    r.reg_error("UNAVAILABLE")
+    await r.clock.advance(1000)
+    r.reg_error("SERVER_DISABLED", id="srv_anki")
+    r.app(op="enable", id="srv_anki", name="anki")
+    r.reg_error("UNAVAILABLE")
+    last = r.of("retry")[-1]
+    assert isinstance(last, RetryInfo) and (last.attempt, last.delay_ms) == (1, 1000)
+    await r.clock.advance(1000)
+    await r.done()
+
+
+async def test_a_refusal_after_a_registration_resets_the_transient_counter() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.registered()
+    r.session.on_disconnect()
+    r.session.on_welcome()
+    r.reg_error("INTERNAL")
+    await r.clock.advance(1000)
+    assert r.ops() == ["register"] * 3
+    r.reg_error("CONFLICT")
+    r.session.on_disconnect()
+    r.session.on_welcome()
+    r.reg_error("INTERNAL")
+    last = r.of("retry")[-1]
+    assert isinstance(last, RetryInfo) and (last.attempt, last.delay_ms) == (1, 1000)
+    await r.clock.advance(1000)
+    await r.done()
+
+
+async def test_a_whole_frame_error_does_not_reset_the_transient_counter() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.reg_error("INTERNAL")
+    await r.clock.advance(1000)
+    r.app(op="error", code="UNKNOWN_OP", message="m")
+    r.app(op="enable", id="srv_anki", name="anki")
+    r.reg_error("INTERNAL")
+    last = r.of("retry")[-1]
+    assert isinstance(last, RetryInfo) and (last.attempt, last.delay_ms) == (2, 2000)
+    await r.clock.advance(2000)
+    await r.done()
+
+
+async def test_any_unregistered_resets_the_transient_counter() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.reg_error("UNAVAILABLE")
+    await r.clock.advance(1000)
+    r.app(op="unregistered", services=[])  # no unregister outstanding
+    r.reg_error("UNAVAILABLE")
+    last = r.of("retry")[-1]
+    assert isinstance(last, RetryInfo) and (last.attempt, last.delay_ms) == (1, 1000)
+    await r.clock.advance(1000)
+    await r.done()
+
+
+async def test_a_whole_frame_error_answering_the_unregister_ends_the_close_wait() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.registered()
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    assert r.ops() == ["register", "unregister"]
+    r.app(op="error", code="TOO_MANY_SERVICES", message="m")
+    await settle()
+    assert closing.done()
+    await r.done()
+
+
+@pytest.mark.parametrize("reply", ["registered", "UNKNOWN_OP", "OVERLOADED"])
+async def test_a_reply_to_the_register_ahead_of_the_unregister_keeps_the_close_wait(
+    reply: str,
+) -> None:
+    """MCPWARP.md §3.2 Unregister (v0.7.1): the wait ends on the `unregister`'s own reply by
+    frame order; a register dropped by OVERLOADED while closing is abandoned, never re-sent."""
+    r = Rig()
+    r.session.on_welcome()
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    assert r.ops() == ["register", "unregister"]
+    if reply == "registered":
+        r.registered()
+        assert r.of("registered") == []
+    else:
+        r.app(op="error", code=reply, message="m")
+    await r.clock.advance(1500)
+    assert not closing.done()
+    assert r.ops() == ["register", "unregister"] and r.of("retry") == []
+    r.app(op="error", code="TOO_MANY_SERVICES", message="m")
+    await settle()
+    assert closing.done()
+    await r.done()
+
+
+async def test_close_during_the_overloaded_pause_abandons_the_dropped_register() -> None:
+    """Registered earlier on this connection, so close() unregisters; no register is ahead of
+    the `unregister`, so the next reply is the `unregister`'s own."""
+    r = Rig()
+    r.session.on_welcome()
+    r.registered()
+    r.app(op="enable", id="srv_anki", name="anki")
+    r.overloaded()
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    assert r.ops() == ["register", "register", "unregister"]
+    r.app(op="error", code="TOO_MANY_SERVICES", message="m")
+    await settle()
+    assert closing.done()
+    assert r.ops() == ["register", "register", "unregister"]
+    await r.done()
+
+
+async def test_close_skips_the_unregister_when_every_register_was_dropped() -> None:
+    """MCPWARP.md §3.2 Unregister (v0.7.2): nothing reached the edge, so nothing to unregister;
+    the held name of an earlier connection is gone with it."""
+    r = Rig()
+    r.session.on_welcome()
+    r.registered()
+    r.session.on_disconnect()
+    r.session.on_welcome()
+    r.overloaded()
+    await r.clock.advance(1000)
+    r.overloaded()
+    await asyncio.wait_for(r.session.begin_close(), 1)
+    assert r.ops() == ["register"] * 3
+    await r.done()
+
+
+async def test_close_unregisters_behind_a_re_sent_register_in_flight() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    await r.clock.advance(1000)
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    assert r.ops() == ["register", "register", "unregister"]
+    r.app(op="unregistered", services=[])
+    await closing
+    await r.done()
+
+
+@pytest.mark.parametrize("reply", ["UNKNOWN_OP", "empty"])
+async def test_close_unregisters_after_a_register_answered_by_an_error_or_empty_reply(
+    reply: str,
+) -> None:
+    r = Rig()
+    r.session.on_welcome()
+    if reply == "empty":
+        r.app(op="registered", services=[])
+        await r.clock.advance(1000)  # the transient re-send
+    else:
+        r.app(op="error", code=reply, message="m")
+        r.app(op="enable", id="srv_anki", name="anki")
+    r.overloaded()
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    assert r.ops()[-1] == "unregister"
+    r.app(op="unregistered", services=[])
+    await closing
+    await r.done()
+
+
+async def test_connection_limit_ahead_of_the_unregister_answers_nothing() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    r.app(op="error", code="CONNECTION_LIMIT", message="m")
+    r.registered()  # still settles the register ahead
+    await settle()
+    assert not closing.done()
+    r.app(op="error", code="TOO_MANY_SERVICES", message="m")
+    await settle()
+    assert closing.done()
+    await r.done()
+
+
+async def test_unsupported_version_ahead_of_the_unregister_is_fatal() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    r.app(op="error", code="UNSUPPORTED_VERSION", message="v2 only")
+    assert [e.code for e in r.fatals] == ["UNSUPPORTED_VERSION"]
+    assert not r.session._register_ahead
+    r.session.mark_closed()  # expose.py's fatal path
+    await closing
+    await r.done()
+
+
+async def test_an_error_answering_the_register_ahead_ends_the_overloaded_streak() -> None:
+    """§2.6: any non-OVERLOADED reply resets `n`, so the unregister's OVERLOADED is n = 1."""
+    r = Rig()
+    r.session.on_welcome()
+    r.overloaded()
+    await r.clock.advance(1000)
+    assert r.ops() == ["register", "register"]
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    r.app(op="error", code="BAD_REQUEST", message="m")
+    r.overloaded()
+    await r.clock.advance(1000)
+    assert r.ops() == ["register", "register", "unregister", "unregister"]
+    r.app(op="unregistered", services=[])
+    await settle()
+    assert closing.done()
+    await r.done()
+
+
+async def test_the_abandoned_registers_overloaded_counts_in_the_streak() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    r.overloaded()  # drops the register ahead: n = 1
+    r.overloaded()  # drops the unregister: n = 2, re-sent after 2000 ms, the whole budget
+    await r.clock.advance(1999)
+    assert r.ops() == ["register", "unregister"] and not closing.done()
+    await r.clock.advance(1)
+    await settle()
+    assert closing.done()
+    await r.done()
+
+
 async def test_a_malformed_envelope_is_a_non_fatal_error_and_changes_nothing() -> None:
     r = Rig()
     r.session.on_welcome()
@@ -380,17 +914,42 @@ async def test_a_malformed_envelope_is_a_non_fatal_error_and_changes_nothing() -
 # --- disable / enable --------------------------------------------------------------------------
 
 
-async def test_disable_matches_the_server_id_or_applies_before_any_is_known() -> None:
+async def test_disable_matches_the_server_id_and_holds_an_unknown_one() -> None:
+    """MCPWARP.md §2.7 Unknown `disable` id (T49): held, never adopted."""
     r = Rig()
     r.session.on_welcome()
     r.app(op="disable", id="srv_early")
-    assert r.state() == ExposeState.DISABLED and r.session.server_id == "srv_early"
+    assert r.state() == ExposeState.REGISTERING and r.session.server_id is None
     r.registered()
     r.app(op="disable", id="srv_someone_else")
     assert r.state() == ExposeState.REGISTERED
     r.app(op="disable", id="srv_anki", reason="abuse")
     assert r.state() == ExposeState.DISABLED
-    assert r.of("disabled") == [Disabled("srv_early", "disabled"), Disabled("srv_anki", "abuse")]
+    assert r.of("disabled") == [Disabled("srv_anki", "abuse")]
+    await r.done()
+
+
+async def test_a_held_disable_applies_with_the_registered_bringing_its_id() -> None:
+    """MCPWARP.md §5.9 Held `disable`: `registered` then `disabled`, back to back, the
+    `registered` marked so the tunnel collapses the pair (T50); an `enable` for the id drops
+    the held one."""
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="disable", id="srv_anki", reason="abuse")
+    r.registered()
+    assert r.state() == ExposeState.DISABLED and r.session.server_id == "srv_anki"
+    assert [e for e, _, _ in r.events] == ["registered", "disabled"]
+    assert r.details("registered") == ["held_disable"]
+    assert r.of("disabled") == [Disabled("srv_anki", "abuse")]
+    assert r.session.ever_registered
+    await r.done()
+
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="disable", id="srv_anki")
+    r.app(op="enable", id="srv_anki", name="anki")
+    r.registered()
+    assert r.state() == ExposeState.REGISTERED and r.of("disabled") == []
     await r.done()
 
 
@@ -405,6 +964,62 @@ async def test_enable_re_registers_and_adopts_the_id() -> None:
     assert r.of("enabled") == [Enabled("srv_new")]
     assert r.state() == ExposeState.REGISTERING and r.session.server_id == "srv_new"
     assert r.ops() == ["register", "register"]
+    await r.done()
+
+
+async def test_enable_matches_by_name_or_server_id() -> None:
+    """MCPWARP.md §2.7 enable row: `name` equals the agent's, or `id` its server id."""
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="enable", id="srv_anki", name="other")  # no server id known yet: not ours
+    assert r.of("enabled") == []
+    r.registered()
+    r.app(op="disable", id="srv_anki")
+    r.app(op="enable", id="srv_anki", name="other")  # by id
+    assert r.of("enabled") == [Enabled("srv_anki")] and r.state() == ExposeState.REGISTERING
+    r.registered()
+    r.app(op="enable", id="srv_x", name="anki")  # by name, as before; the id is adopted
+    assert r.of("enabled")[-1] == Enabled("srv_x") and r.session.server_id == "srv_x"
+    await r.done()
+
+
+async def test_enable_by_id_drops_a_held_disable_for_that_id() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="disable", id="srv_anki")  # unknown yet: held
+    r.app(op="enable", id="srv_anki", name="other")  # not ours (no id known), still drops it
+    assert r.of("enabled") == []
+    r.registered()
+    assert r.state() == ExposeState.REGISTERED and r.of("disabled") == []
+    await r.done()
+
+
+async def test_held_disables_end_with_their_connection() -> None:
+    """The next connection's register answer is authoritative: a disconnect (or a take-over)
+    drops what was held."""
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="disable", id="srv_anki")  # unknown yet: held
+    r.session.on_disconnect()
+    r.session.on_welcome()
+    r.registered()
+    assert r.state() == ExposeState.REGISTERED and r.of("disabled") == []
+    await r.done()
+
+    # A drain hand-over: the replacement's welcome, with no on_disconnect for the old one.
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="disable", id="srv_anki")
+    r.session.on_welcome()
+    r.registered()
+    assert r.state() == ExposeState.REGISTERED and r.of("disabled") == []
+    await r.done()
+
+    r = Rig()
+    r.session.on_welcome()
+    r.app(op="disable", id="srv_other")
+    r.app(op="conflict", id="srv_anki", name="anki")
+    assert r.session.taken_over and r.session._held_disables == {}
     await r.done()
 
 
@@ -588,6 +1203,23 @@ async def test_a_take_over_during_the_unregister_wait_ends_it_without_an_event(h
     await settle()
     assert closing.done()
     assert r.session.taken_over and r.state() == ExposeState.CLOSING
+    assert r.of("conflict") == []
+    await r.done()
+
+
+async def test_a_conflict_for_another_service_during_the_unregister_wait_is_ignored() -> None:
+    r = Rig()
+    r.session.on_welcome()
+    r.registered()
+    closing = asyncio.create_task(r.session.begin_close())
+    await settle()
+    r.app(op="conflict", id="srv_other", name="other", reason="taken_over")
+    await settle()
+    assert not closing.done()
+    assert not r.session.taken_over and r.state() == ExposeState.CLOSING
+    r.app(op="conflict", id="srv_anki", name="anki", reason="taken_over")
+    await settle()
+    assert closing.done() and r.session.taken_over
     assert r.of("conflict") == []
     await r.done()
 

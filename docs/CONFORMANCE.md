@@ -1,6 +1,6 @@
 # Conformance
 
-Two layers check this SDK against ws-mixer-spec at `spec.pin` (v0.6.1):
+Two layers check this SDK against ws-mixer-spec at `spec.pin` (v0.8.0):
 
 1. **pytest fixture suites** (`tests/spec/`): every fixture file the spec ships for a client
    SDK, run in-process on a fake clock.
@@ -28,29 +28,52 @@ at `goserver.pin` (v0.8.0) into `.goserver/`. Pins are tags, never SHAs.
 
 ## Fixture suites (pytest)
 
-| Suite | File | Cases at v0.6.1 | What is checked |
+| Suite | File | Cases at v0.8.0 | What is checked |
 |---|---|---|---|
 | frames | `tests/spec/test_frames.py` | 29 | `decode_frame` gives `.decoded` or fails with `.expect`. |
-| control | `tests/spec/test_control.py` | 47 | `parse_control` agrees with `wire_valid`; `control.schema.json` agrees with `schema_valid` and `control.relaxed.schema.json` with `wire_valid`. |
-| sequences | `tests/spec/test_sequences.py` | 43: 24 client run, 19 server skipped | Client transcripts replayed against a real `MixerConn` over `FakeWebSocket` on `FakeClock`, at the spec's real timer values. Server transcripts are skipped: the SDK is client-only. |
-| envelope | `tests/spec/test_envelope.py` | 60 | Decode, `MALFORMED_ENVELOPE` or `Unknown`; register/unregister byte-exact against the encoder; every case also through `mcpwarp.schema.json`. |
-| bridging | `tests/spec/test_bridging.py` | 14: 13 run, 1 skipped | Raw HTTP/1.1 through `serve_stream`: byte-exact SDK replies, handler call, CLOSE/RESET. |
-| tunnel | `tests/spec/test_tunnel.py` | 34 | `create_tunnel()` over a scripted edge: `to_dict()` snapshots, `expectDials`, nothing left running after `dispose()`. Each `disconnect` event also checks the SDK's own `fatal` verdict against the fixture. |
-| status-text | `tests/spec/test_status_text.py` | 8 files: 6 locales, `cases.json` (26 cases), `rules.json` | Tables string-identical to the spec JSON; every case; resolution order and joiners. |
+| control | `tests/spec/test_control.py` | 51 | `parse_control` agrees with `wire_valid`; `control.schema.json` agrees with `schema_valid` and `control.relaxed.schema.json` with `wire_valid`. |
+| sequences | `tests/spec/test_sequences.py` | 44: 25 client run, 19 server skipped | Client transcripts replayed against a real `MixerConn` over `FakeWebSocket` on `FakeClock`, at the spec's real timer values. Server transcripts are skipped: the SDK is client-only. |
+| envelope | `tests/spec/test_envelope.py` | 68: 57 run, 11 skipped | Decode, `MALFORMED_ENVELOPE` or `Unknown`; register/unregister byte-exact against the encoder; every case that runs also through `mcpwarp.schema.json`. |
+| bridging | `tests/spec/test_bridging.py` | 27: 22 run, 5 skipped | Raw HTTP/1.1 (`in` written as UTF-8) through `serve_stream`: byte-exact SDK replies, the forwarded target byte for byte, handler call, CLOSE/RESET. Target mode uses a local stub server that echoes or hangs. |
+| tunnel | `tests/spec/test_tunnel.py` | 58: 44 run, 14 skipped | `create_tunnel()` over a scripted edge: `to_dict()` snapshots, `expectDials`, nothing left running after `dispose()`. Each `disconnect` event also checks the SDK's own `fatal` verdict against the fixture. `token_provider` events drive a token provider; `disconnect.flush_after` ops are handed to the layer right after the SDK reports the close (the `post-disconnect-delivery` runner requirement). |
+| status-text | `tests/spec/test_status_text.py` | 8 files: 6 locales, `cases.json` (37 cases: 26 run, 11 skipped), `rules.json` | The `<state>.<CODE>` keys string-identical to the spec JSON (the seven multi-service keys must be present, not rendered); every case; resolution order and joiners. |
 
-The counts are pinned in the test files (`EXPECTED_*` exact, `MIN_*` floors). Bump them together
-with `spec.pin`.
+The counts are pinned in the test files, exact at the pin, together with each multi-service
+allow-list and its size; a listed fixture missing from the tag fails the count test. Bump them
+together with `spec.pin`.
 
-Unreleased fixtures: the sibling `../ws-mixer-spec` checkout has uncommitted work toward the next
-release with 2 more tunnel fixtures and 3 more `envelope/invalid` cases than v0.6.1. With
-`WSMIXER_SPEC_DIR=../ws-mixer-spec` the suites give 268 passed, 20 skipped (263 passed,
-20 skipped at the pin). The default locator ignores that checkout because its `spec/` tree is
-not clean.
+At the pin the suites give 284 passed, 60 skipped: sequences 19, envelope 11, bridging 5,
+tunnel 14, status-text 11.
+
+### Profile
+
+Since v0.8.0 no SDK ships a multi-service controller (MCPWARP.md section 1; section 6A is
+informative host guidance), and section 10.6 Fixture status classifies the multi-service
+fixtures as host guidance, which an SDK runner skips by default. Each runner skips them by a
+declared allow-list, with the reason `host guidance, §10.6 Fixture status: <fixture>`:
+
+- **envelope, 2**: `valid/register_batch_valid` and `valid/register_two_services`, multi-entry
+  registers a single-service encoder cannot produce; their schema verdicts are skipped too
+  (docs/DEVIATIONS.md, schema verdicts). The other new envelope cases run:
+  `registered_partial_errors`, `unregistered_subset` and `conflict_per_name` through the decoder.
+- **bridging, 4**: `multi_service_route_by_header`, `multi_service_route_by_host`,
+  `multi_service_unknown_service_503`, `multi_service_unknown_service_non_mcp_404` (section 4.8
+  routing).
+- **tunnel, 14**: `ms_01` to `ms_14`, the group fixtures of the multi-service controller.
+- **status-text, 11 cases**: the nine `describeServiceStatus` cases and the two
+  `NO_SERVICE_REGISTERED` cases (`rules.json` `hostOnlyCases`). The `service.*` and
+  `lastError.NO_SERVICE_REGISTERED` keys (`rules.json` `hostOnly`, optional) are not in the
+  shipped tables.
 
 Skip notes:
 
 - **sequences, 19 skipped.** `role: "server"` transcripts are written from the server's side;
   this SDK has no server role.
+- **multi-service fixtures**: see Profile above.
+- **envelope, 9 schema-only skipped** (reason `schema verdict only, checker/CI tooling, §10.6`).
+  Agent->edge cases whose only verdict is the edge's schema check (`SCHEMA_*` hints and
+  `register_batch_101_invalid`'s `TOO_MANY_SERVICES`): schema verdicts are checker/CI tooling,
+  and an SDK runner asserts wire verdicts only (section 10.6, as clarified for v0.8.1).
 - **bridging, 1 skipped** (`body_413_streamed_reset`). The `*_reset` fixtures apply only to an
   adapter that streams the request body to the app. This SDK always buffers the body before the
   handler runs, so a body over the cap is a 413 before any response byte; `body_413` covers that
@@ -117,7 +140,7 @@ Add `--fixture <name>` to run one fixture (the floors are then not enforced).
 
 | Key | Floor | Meaning |
 |---|---|---|
-| `python-client` | 24 | Fixture mode, client role: all 24 client fixtures pass. |
+| `python-client` | 25 | Fixture mode, client role: all 25 client fixtures pass. |
 | `go->python` | 10 | Pair mode with ws-mixer-go v0.8.0 as server: all 10 scenarios pass. |
 
 `python-server` is all SKIP and has no floor. Each floor is the count actually observed passing;

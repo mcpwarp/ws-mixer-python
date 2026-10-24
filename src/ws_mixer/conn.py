@@ -527,7 +527,8 @@ class MixerConn(Emitter):
                 drain = {
                     "t": "drain",
                     "reason": "client_requested",
-                    "last_stream_id": 0,
+                    # WIRE.md 2.9 Client side of a drain: the highest OPEN id received so far.
+                    "last_stream_id": self._highest_opened,
                     "deadline_ms": max(0, int(grace_ms)),
                 }
                 self._enqueue_control(encode_data(0, encode_control(drain)))

@@ -41,6 +41,7 @@ from .conn import (
 from .control import DEFAULT_MAX_STREAMS, DEFAULT_WINDOW, AgentInfo, Welcome
 from .errors import ErrorCode, WsMixerError, code_name, is_token_unavailable
 from .socket import (
+    MAX_RETRY_AFTER_MS,
     SUBPROTOCOL,
     ProxyRejected,
     UnexpectedSubprotocol,
@@ -319,13 +320,16 @@ class MixerClient(Emitter):
 
         # mcpwarp hooks: like on_app/on_disconnect, plus whether the event concerns a connection
         # other than the serving one (a drain-superseded predecessor, or a replacement dial
-        # failing while the drained connection still serves).
-        self._on_app_from: Callable[[dict[str, Any], bool], None] | None = None
+        # failing while the drained connection still serves). `_on_app_from` also gets whether
+        # the delivering connection has ended (its queue flushing after the close).
+        self._on_app_from: Callable[[dict[str, Any], bool, bool], None] | None = None
         self._on_disconnect_from: Callable[[DisconnectReason, bool], None] | None = None
 
         self._state: ClientState = "idle"
         self._conn: MixerConn | None = None
         self._dialing_conn: MixerConn | None = None
+        self._welcome_burst: MixerConn | None = None
+        """A connection whose welcome was read in the current loop turn."""
         self._retiring_conn: MixerConn | None = None
         self._superseded: set[MixerConn] = set()
         self._replaced: weakref.WeakSet[MixerConn] = weakref.WeakSet()
@@ -654,6 +658,11 @@ class MixerClient(Emitter):
             and not self._done()
         ):
             self._unauthorized_retry_used = True
+            # Every disconnect is reported (CLIENT-SDK.md Disconnect reason shape), this
+            # non-fatal one too; the mcpwarp tunnel turns it into T48.
+            self._notify(result.ctx.reason(False), superseded=self._conn is not None)
+            if self._done():
+                return
             self._call(self._on_reconnect, ReconnectInfo(1, 0, "token-refresh"))
             result = await self._dial_and_handshake(refresh=True)
 
@@ -819,6 +828,8 @@ class MixerClient(Emitter):
     def _on_welcome(self, conn: MixerConn, welcome: Welcome) -> None:
         # Promoted synchronously, from inside the welcome's own dispatch, so a drain or app
         # right behind it on the wire already sees this as the active connection.
+        self._welcome_burst = conn
+        asyncio.get_running_loop().call_soon(self._end_welcome_burst, conn)
         if self._dialing_conn is conn:
             self._dialing_conn = None
         if self._done():
@@ -841,6 +852,10 @@ class MixerClient(Emitter):
         self._call(self._on_connect, welcome)
         self._settle_start(None)
 
+    def _end_welcome_burst(self, conn: MixerConn) -> None:
+        if self._welcome_burst is conn:
+            self._welcome_burst = None
+
     def _deliver_stream(self, stream: MixerStream) -> Awaitable[None] | None:
         self.emit("stream", stream)
         return None if self._on_stream is None else self._on_stream(stream)
@@ -848,7 +863,7 @@ class MixerClient(Emitter):
     def _deliver_app(self, conn: MixerConn, body: dict[str, Any]) -> Awaitable[None] | None:
         self.emit("app", body)
         if self._on_app_from is not None:
-            self._on_app_from(body, conn in self._replaced)
+            self._on_app_from(body, conn in self._replaced, conn.closed)
         return None if self._on_app is None else self._on_app(body)
 
     def _drain_received(self, conn: MixerConn, info: DrainInfo) -> None:
@@ -858,8 +873,10 @@ class MixerClient(Emitter):
         self._drain_info[conn] = info
 
     def _drain_delay(self, info: DrainInfo) -> float:
-        # retry_after_ms is a floor; the jitter goes on top (spec v0.6.3).
-        return (info.retry_after_ms or 0) + self._random() * DRAIN_JITTER_MS
+        # retry_after_ms is a floor; the jitter goes on top (spec v0.6.3). The hint and the
+        # total are capped at 2^31-1 ms as in JS; the int compare also bounds a huge literal.
+        hint = float(min(info.retry_after_ms or 0, MAX_RETRY_AFTER_MS))
+        return min(hint + self._random() * DRAIN_JITTER_MS, float(MAX_RETRY_AFTER_MS))
 
     def _deliver_drain(self, conn: MixerConn, info: DrainInfo) -> Awaitable[None] | None:
         self._drain_decided.add(conn)
@@ -877,6 +894,13 @@ class MixerClient(Emitter):
 
     def _on_conn_close(self, conn: MixerConn, info: CloseInfo) -> None:
         was_active = self._conn is conn
+        if self._welcome_burst is conn:
+            # Closed in the same delivery burst as its welcome: nothing queued behind the
+            # welcome is delivered (CLIENT-SDK.md Handler delivery), a drain included, so the
+            # disconnect below takes the connected-phase policy, not the drain's.
+            self._welcome_burst = None
+            conn.cancel_delivery()
+            self._drain_info.pop(conn, None)
         if was_active:
             self._conn = None
         if self._dialing_conn is conn:

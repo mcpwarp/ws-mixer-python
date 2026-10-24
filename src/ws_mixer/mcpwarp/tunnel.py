@@ -45,7 +45,7 @@ from .expose import (
 )
 from .http import Handler
 from .serve import DEFAULT_MAX_REQUEST_BODY_BYTES
-from .session import Conflict, Disabled, Registration, RetryInfo
+from .session import HELD_DISABLE, Conflict, Disabled, Registration, RetryInfo
 from .status import Problem, TunnelState, TunnelStatus
 
 DEFAULT_DISPOSE_TIMEOUT_MS = 5000
@@ -405,6 +405,8 @@ class Tunnel:
     def _observe(self, event: str, payload: object, detail: str | None, cfg: _Desired) -> None:
         """One exposure event of the current generation (JS tunnel.ts observe())."""
         if event == "registered" and isinstance(payload, Registration):
+            if detail == HELD_DISABLE:
+                return  # the `disabled` right behind it is the one snapshot (T50)
             self._log(_INFO, f"online at {payload.url}")
             self._set_status(TunnelStatus(TunnelState.ONLINE, payload.url))
         elif event == "disabled" and isinstance(payload, Disabled):

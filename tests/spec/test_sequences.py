@@ -46,9 +46,9 @@ from ws_mixer.socket import WebSocketInit
 from ws_mixer.stream import MixerStream
 from ws_mixer.testing import FakeClock, FakeConnector, FakeWebSocket, settle
 
-# Fixture counts at spec.pin v0.6.1; bump together with the pin.
-EXPECTED_SEQUENCE_FIXTURES = 43
-EXPECTED_CLIENT_FIXTURES = 24
+# Fixture counts at spec.pin v0.8.0; bump together with the pin.
+EXPECTED_SEQUENCE_FIXTURES = 44
+EXPECTED_CLIENT_FIXTURES = 25
 # Sends the SDK makes on its own; every other stream RESET is an application command.
 AUTONOMOUS_RESETS = {ErrorCode.STREAM_LIMIT, ErrorCode.STREAM_CLOSED}
 

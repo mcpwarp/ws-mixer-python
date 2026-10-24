@@ -27,7 +27,9 @@ from .frame import MAX_MESSAGE_SIZE
 SUBPROTOCOL = "ws-mixer.v1"
 MAX_CLOSE_REASON = 123
 """UTF-8 bytes in a close reason (a control frame payload is at most 125 bytes)."""
-MAX_RETRY_AFTER_MS = 3_600_000.0
+MAX_RETRY_AFTER_MS = 2**31 - 1
+"""Cap on a server's retry hint (429 `Retry-After`, `drain.retry_after_ms`): the largest JS
+timer delay, as the JS SDK clamps it."""
 
 _RESERVED_HEADERS = frozenset({"host", "upgrade", "connection", "content-length"})
 # `Number(s)` for a trimmed, non-empty string: a decimal literal or a 0x/0o/0b integer.
@@ -117,7 +119,7 @@ def _js_number(s: str) -> float | None:
 
 
 def parse_retry_after(value: str | None, now_ms: float | None = None) -> float | None:
-    """Retry-After (RFC 9110 section 10.2.3) in milliseconds, clamped to [0, 1 h].
+    """Retry-After (RFC 9110 section 10.2.3) in milliseconds, clamped to [0, 2^31-1].
 
     Numbers follow JavaScript's `Number()` as the JS SDK does ("1e3", "-1" and "" all parse);
     otherwise an HTTP-date, measured from `now_ms` (Unix epoch ms, default the wall clock).
@@ -135,7 +137,7 @@ def parse_retry_after(value: str | None, now_ms: float | None = None) -> float |
         if when.tzinfo is None:
             return None
         ms = when.timestamp() * 1000 - (wall_ms() if now_ms is None else now_ms)
-    return min(max(0.0, ms), MAX_RETRY_AFTER_MS)
+    return min(max(0.0, ms), float(MAX_RETRY_AFTER_MS))
 
 
 def check_close_args(code: int, reason: str) -> None:

@@ -17,7 +17,7 @@ from ws_mixer.frame import (
     window_increment,
 )
 
-# Fixture count at spec.pin v0.6.1; bump together with the pin.
+# Fixture count at spec.pin v0.8.0; bump together with the pin.
 EXPECTED_FRAME_FIXTURES = 29
 
 # Informational keys in `decoded` that describe the input rather than the decoded frame.
