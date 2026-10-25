@@ -16,7 +16,7 @@ from jsonschema import Draft202012Validator
 from ws_mixer.control import parse_control
 from ws_mixer.errors import ConnError, code_name
 
-# Fixture count at spec.pin v0.8.1; bump together with the pin.
+# Fixture count at spec.pin v0.8.2; bump together with the pin.
 EXPECTED_CONTROL_FIXTURES = 51
 MESSAGE_TYPES = {"hello", "welcome", "ping", "pong", "drain", "error", "app", "envelope"}
 

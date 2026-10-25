@@ -23,7 +23,7 @@ from ws_mixer._jscompat import JS_WHITESPACE
 from ws_mixer.mcpwarp import STATUS_LOCALES, TunnelStatusCode, describe_status
 from ws_mixer.mcpwarp.status_text import _JOINERS, _TABLES
 
-# Counts at spec.pin v0.8.1: six locale tables plus cases.json and rules.json; 37 cases.
+# Counts at spec.pin v0.8.2: six locale tables plus cases.json and rules.json; 37 cases.
 STATUS_TEXT_FILES = 8
 CASES = 37
 PROFILE_SKIP = "host guidance, §10.6 Fixture status"

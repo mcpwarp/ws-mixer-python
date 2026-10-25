@@ -1,6 +1,6 @@
 # Deviations
 
-Every known place where this SDK differs from the spec text at `spec.pin` (v0.8.1) or from
+Every known place where this SDK differs from the spec text at `spec.pin` (v0.8.2) or from
 ws-mixer-js 0.11.2, and why. Each entry has one mark:
 
 - **spec-ruled**: the spec session ruled on it, the ruling is not in the pinned text yet, and

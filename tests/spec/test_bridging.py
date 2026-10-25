@@ -37,7 +37,7 @@ from ws_mixer.mcpwarp.serve import Availability, serve_stream
 from ws_mixer.stream import Finished, MixerStream
 from ws_mixer.testing import FakeClock, settle
 
-# The fixture count at spec.pin v0.8.1.
+# The fixture count at spec.pin v0.8.2.
 BRIDGING_FIXTURES = 27
 PROFILE_SKIP = "host guidance, §10.6 Fixture status"
 # Section 10.6: routing between the services of one connection (section 4.8).

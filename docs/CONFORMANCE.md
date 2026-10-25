@@ -1,6 +1,6 @@
 # Conformance
 
-Two layers check this SDK against ws-mixer-spec at `spec.pin` (v0.8.1):
+Two layers check this SDK against ws-mixer-spec at `spec.pin` (v0.8.2):
 
 1. **pytest fixture suites** (`tests/spec/`): every fixture file the spec ships for a client
    SDK, run in-process on a fake clock.
@@ -28,7 +28,7 @@ at `goserver.pin` (v0.8.0) into `.goserver/`. Pins are tags, never SHAs.
 
 ## Fixture suites (pytest)
 
-| Suite | File | Cases at v0.8.1 | What is checked |
+| Suite | File | Cases at v0.8.2 | What is checked |
 |---|---|---|---|
 | frames | `tests/spec/test_frames.py` | 29 | `decode_frame` gives `.decoded` or fails with `.expect`. |
 | control | `tests/spec/test_control.py` | 51 | `parse_control` agrees with `wire_valid`; `control.schema.json` agrees with `schema_valid` and `control.relaxed.schema.json` with `wire_valid`. |
