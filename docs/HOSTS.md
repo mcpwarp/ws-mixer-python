@@ -198,7 +198,8 @@ instead, with `run_coroutine_threadsafe(tunnel.dispose(...), loop).result(timeou
 
 `dispose()` sends `unregister` (waits up to 2 s for `unregistered`), then closes gracefully
 (drain up to 5 s). With `timeout_ms=2000` it returns after at most 2 s and leaves the rest to the
-background; stopping the loop then cancels it. The edge sees an abrupt close at worst, and the
+background; stopping the loop then cancels it (call `tunnel.abort()` on the loop first to drop
+the sockets still closing as well). The edge sees an abrupt close at worst, and the
 next register takes the name back. `dispose()` is final: create a new tunnel for the next
 profile. `dispose(timeout_ms=...)` raises `TypeError`/`ValueError` at the call for a timeout that
 is not a positive finite number.

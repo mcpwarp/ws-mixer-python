@@ -9,10 +9,10 @@ drained by a main-thread timer), otherwise on the loop thread.
 `stop()` is bounded, idempotent and safe even if `start()` never ran:
 1. `dispose()` with 0.8 x timeout, so the unregister and the close handshake get their chance
    (skipped for a zero timeout);
-2. one synchronous teardown step on the loop: `abort()` on every socket this run dialed (a
-   no-op for those that already closed), so a hung edge cannot keep a transport open past the
-   timeout; every subscription detached from this run's Tunnel; and a final "off" for any
-   subscriber that has not seen one yet;
+2. one synchronous teardown step on the loop: `Tunnel.abort()`, which drops every socket of
+   the run still open (and any dial landing later), so a hung edge cannot keep a transport open
+   past the timeout; every subscription detached from this run's Tunnel; and a final "off" for
+   any subscriber that has not seen one yet;
 3. `LoopThread.stop()`: cancel what is left, stop the loop, join the thread with the rest.
 Anything under ~2.5 s skips part of the graceful unregister; the edge then sees an abrupt
 close, which the next register overrides anyway.
@@ -26,17 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import dataclasses
 import inspect
 import logging
 import threading
-import weakref
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
 from .._rfc6455 import StdlibConnector
 from ..clock import LoopClock, monotonic_ms
-from ..socket import WebSocketConnection, WebSocketConnector, WebSocketInit
 from ..threaded import Dispatch, LoopThread, clamp_timeout
 from .status import TunnelState, TunnelStatus
 from .tunnel import Tunnel, TunnelConfig, TunnelOptions, create_tunnel
@@ -44,61 +41,16 @@ from .tunnel import Tunnel, TunnelConfig, TunnelOptions, create_tunnel
 T = TypeVar("T")
 
 _OFF = TunnelStatus(TunnelState.OFF)
-_CONFIG_FIELDS = tuple(f.name for f in dataclasses.fields(TunnelConfig))
 DISPOSE_SHARE = 0.8
 """The share of stop()'s timeout given to the graceful dispose()."""
 
 
-class _Sockets:
-    """The sockets one run dialed; weakly held when the connection type allows it."""
-
-    def __init__(self) -> None:
-        self._weak: weakref.WeakSet[WebSocketConnection] = weakref.WeakSet()
-        self._strong: list[WebSocketConnection] = []
-        self.aborted = False
-
-    def add(self, ws: WebSocketConnection) -> None:
-        try:
-            self._weak.add(ws)
-        except TypeError:
-            self._strong.append(ws)
-
-    def all(self) -> list[WebSocketConnection]:
-        return [*self._weak, *self._strong]
-
-
-class _Tracked:
-    """A connector that records what it dials. Compares equal by the connector it wraps, so
-    configure()'s idempotence is unchanged."""
-
-    def __init__(self, inner: WebSocketConnector, sockets: _Sockets) -> None:
-        self.inner = inner
-        self._sockets = sockets
-
-    async def __call__(self, url: str, init: WebSocketInit) -> WebSocketConnection:
-        ws = await self.inner(url, init)
-        self._sockets.add(ws)
-        if self._sockets.aborted:
-            ws.abort()  # dialed after stop() aborted everything
-        return ws
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, _Tracked):
-            return NotImplemented
-        return bool(self.inner == other.inner)
-
-    def __hash__(self) -> int:
-        return hash(self.inner)
-
-
 class _Gen:
-    """One start()..stop(): the loop it runs on, its Tunnel (created on that loop) and the
-    sockets it dialed."""
+    """One start()..stop(): the loop it runs on and its Tunnel (created on that loop)."""
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
         self.tunnel: Tunnel | None = None  # set on the loop
-        self.sockets = _Sockets()
         self.torn_down = threading.Event()  # the teardown step ran
         self.finished = threading.Event()  # stop() is done with this run
         self.stop_task: asyncio.Task[None] | None = None  # a stop() from the loop thread
@@ -138,7 +90,6 @@ class ThreadedTunnel:
                 "ThreadedTunnel: a LoopClock binds to one loop and every start() makes a new "
                 "one; leave `clock` unset"
             )
-        self._connector: WebSocketConnector = given if given is not None else StdlibConnector()
         logger = options.logger if options is not None else kwargs.get("logger")
         self._logger: logging.Logger = logger or logging.getLogger("mcpwarp")
         self._lt = LoopThread(name=thread_name, dispatch=dispatch)
@@ -242,7 +193,7 @@ class ThreadedTunnel:
         online). Any thread. RuntimeError when not started."""
         with self._lock:
             gen = self._live()
-            return self._lt.submit(self._configure(gen, self._track_config(gen, config)))
+            return self._lt.submit(self._configure(gen, config))
 
     def disconnect(self) -> concurrent.futures.Future[None]:
         """Tunnel.stop(): unregisters, goes "off", and configure() starts again (even with the
@@ -303,12 +254,8 @@ class ThreadedTunnel:
 
     def _boot(self, gen: _Gen) -> None:
         """On the loop: the run's Tunnel, and every subscription attached to it."""
-        tracked = _Tracked(self._connector, gen.sockets)
         try:
-            if self._options is not None:
-                gen.tunnel = create_tunnel(dataclasses.replace(self._options, web_socket=tracked))
-            else:
-                gen.tunnel = create_tunnel(**{**self._kwargs, "web_socket": tracked})
+            gen.tunnel = create_tunnel(self._options, **self._kwargs)
         except Exception:
             self._logger.exception("could not create the tunnel")
             return
@@ -347,27 +294,6 @@ class ThreadedTunnel:
 
         self._lt.dispatch_callback(call)
 
-    def _track_config(
-        self, gen: _Gen, config: TunnelConfig | Mapping[str, Any]
-    ) -> TunnelConfig | Mapping[str, Any]:
-        """The config with its own `web_socket` (if any) recording into this run; anything
-        else, invalid values included, goes to the Tunnel unchanged. Any other object with
-        the config's attributes becomes a Mapping of them."""
-        if isinstance(config, TunnelConfig):
-            ws = config.web_socket
-            if ws is not None and callable(ws):
-                return dataclasses.replace(config, web_socket=_Tracked(ws, gen.sockets))
-        elif isinstance(config, Mapping):
-            ws = config.get("web_socket")
-            if ws is not None and callable(ws):
-                return {**config, "web_socket": _Tracked(ws, gen.sockets)}
-        else:
-            ws = getattr(config, "web_socket", None)
-            if ws is not None and callable(ws):
-                fields = {k: getattr(config, k, None) for k in _CONFIG_FIELDS}
-                return {**fields, "web_socket": _Tracked(ws, gen.sockets)}
-        return config
-
     @staticmethod
     async def _configure(gen: _Gen, config: TunnelConfig | Mapping[str, Any]) -> None:
         if gen.tunnel is not None:
@@ -384,16 +310,15 @@ class ThreadedTunnel:
             await gen.tunnel.dispose(timeout_ms)
 
     def _teardown(self, gen: _Gen) -> None:
-        """On the loop, synchronously, before LoopThread.stop() cancels anything: abort every
-        socket of the run, detach every subscription from its Tunnel, and give each subscriber
-        a final "off" if its last status was something else."""
+        """On the loop, synchronously, before LoopThread.stop() cancels anything: abort the
+        run's Tunnel, detach every subscription from it, and give each subscriber a final "off"
+        if its last status was something else."""
         try:
-            gen.sockets.aborted = True
-            for ws in gen.sockets.all():
+            if gen.tunnel is not None:
                 try:
-                    ws.abort()
+                    gen.tunnel.abort()
                 except Exception:
-                    self._logger.exception("aborting a socket failed")
+                    self._logger.exception("aborting the tunnel failed")
             with self._lock:
                 subs = list(self._subs.values())
                 detaches: list[Callable[[], None]] = []

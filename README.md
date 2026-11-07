@@ -92,7 +92,9 @@ fatal `McpwarpError` (`UNAUTHORIZED`, `TAKEN_OVER`, a register error code, ...) 
 serve an ASGI app use `handler=asgi_handler(app)`; to proxy a local server use
 `target="http://127.0.0.1:8000/mcp"`. `handler_timeout_ms=25_000` (an SDK extension, not in the
 spec; default None, no deadline) answers 504 `local server timed out` when a handler has not
-returned its response in time, as `target_timeout_ms` does in target mode.
+returned its response in time, as `target_timeout_ms` does in target mode. For an https target
+with a private CA pass `target_ssl_context=` (an `ssl.SSLContext`; also an SDK extension,
+ignored for http targets).
 
 ## Quickstart: `create_tunnel()`
 
@@ -108,8 +110,10 @@ await tunnel.configure(TunnelConfig(enabled=True, token=token, name="notes"))
 await tunnel.dispose(timeout_ms=2000)  # on shutdown
 ```
 
-`tunnel.status` is an immutable `TunnelStatus`, safe to read from any thread. Hosts without an
-asyncio loop use `ThreadedTunnel` (see [docs/HOSTS.md](docs/HOSTS.md)).
+`dispose()` returns after its bound and lets the close finish in the background, as in JS; if
+you stop the loop right after, call `tunnel.abort()` (a Python addition) to drop the sockets
+still closing. `tunnel.status` is an immutable `TunnelStatus`, safe to read from any thread.
+Hosts without an asyncio loop use `ThreadedTunnel` (see [docs/HOSTS.md](docs/HOSTS.md)).
 
 ## The WebSocket seam
 

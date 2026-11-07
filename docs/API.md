@@ -179,7 +179,7 @@ A listener that raises does not stop the others: its exception is re-emitted as 
 | Name | Signature | Purpose |
 |---|---|---|
 | `expose` | `async expose(options: ExposeOptions \| None = None, /, **kwargs) -> ExposeHandle` | Registers one service and serves its requests. Validates before any I/O (`TypeError`/`ValueError`, spec §5.2 messages). Returns once registered or disabled; raises a fatal `McpwarpError` otherwise. Cancelling the awaiting task closes the client and re-raises `CancelledError`. |
-| `ExposeOptions` | `ExposeOptions(token, name, integration, url=DEFAULT_URL, kind="http", web_socket=None, agent=None, reconnect=None, max_request_body_bytes=4194304, on_retry=None, handler=None, target=None, target_timeout_ms=None, clock=None, random=None, handler_timeout_ms=None)` | Exactly one of `handler` and `target`. `token` may be a `TokenProvider`. `handler_timeout_ms` (SDK extension, `handler` only; see [DEVIATIONS](DEVIATIONS.md)): an async handler with no response by then is cancelled and answered 504 `local server timed out`; None = no deadline. |
+| `ExposeOptions` | `ExposeOptions(token, name, integration, url=DEFAULT_URL, kind="http", web_socket=None, agent=None, reconnect=None, max_request_body_bytes=4194304, on_retry=None, handler=None, target=None, target_timeout_ms=None, clock=None, random=None, handler_timeout_ms=None, target_ssl_context=None)` | Exactly one of `handler` and `target`. `token` may be a `TokenProvider`. `handler_timeout_ms` (SDK extension, `handler` only; see [DEVIATIONS](DEVIATIONS.md)): an async handler with no response by then is cancelled and answered 504 `local server timed out`; None = no deadline. `target_ssl_context` (SDK extension, `target` only, `TypeError` with `handler`): the `ssl.SSLContext` for an https target (not the edge's: that is the connector's `ssl_context`), passed to `target_handler(ssl_context=)` unchanged; ignored for an http target; None = `default_ssl_context()`. |
 | `ExposeHandle` | returned by `expose()` | `url`, `server_id`, `registration`, `path` (`"/mcp"`), `state` (`ExposeState`), `client` (`MixerClient`); `on`/`once` (return an unsubscribe function), `off`; `async close()` (idempotent, never raises); `async with`. |
 | `ExposeState` | `StrEnum`: `connecting`, `registering`, `registered`, `disabled`, `conflict`, `closing`, `closed` | Handle state. |
 | `Agent` | `Agent(runtime=None, os=None)` | Overrides detected runtime/OS (1-64 printable ASCII each). |
@@ -225,13 +225,14 @@ as one `disabled` snapshot.
 | Name | Signature | Purpose |
 |---|---|---|
 | `create_tunnel` | `create_tunnel(options: TunnelOptions \| None = None, /, **kwargs) -> Tunnel` | A stopped tunnel. Synchronous and loop-free. Validates `integration`, `agent` and `handler`/`target` at once. |
-| `TunnelOptions` | `TunnelOptions(integration, agent=None, web_socket=None, max_request_body_bytes=4194304, reconnect=None, on_retry=None, handler=None, target=None, target_timeout_ms=None, logger=None, clock=None, random=None, handler_timeout_ms=None)` | `logger` defaults to `logging.getLogger("mcpwarp")`. `handler_timeout_ms` as in `ExposeOptions`. |
+| `TunnelOptions` | `TunnelOptions(integration, agent=None, web_socket=None, max_request_body_bytes=4194304, reconnect=None, on_retry=None, handler=None, target=None, target_timeout_ms=None, logger=None, clock=None, random=None, handler_timeout_ms=None, target_ssl_context=None)` | `logger` defaults to `logging.getLogger("mcpwarp")`. `handler_timeout_ms` and `target_ssl_context` as in `ExposeOptions`. |
 | `TunnelConfig` | `TunnelConfig(enabled, token, name, url=None, kind=None, web_socket=None)` | What changes at runtime. `token` is a `str` or a `TokenProvider` (called on every dial; compared with `==`). A mapping or any object with these attributes works too. |
 | `Tunnel.status` | property, `TunnelStatus` | Immutable; any thread. |
 | `Tunnel.subscribe` | `subscribe(cb) -> Callable[[], None]` | Calls `cb` now and on every change. Each call registers separately. |
 | `Tunnel.configure` | `async configure(config) -> None` | Applies a config. No-op when unchanged; never raises. Returns once dialing. |
 | `Tunnel.stop` | `async stop() -> None` | Goes `off` at once, then waits for the unregister + drain (up to ~7 s). `configure()` starts again. |
-| `Tunnel.dispose` | `dispose(timeout_ms=5000) -> Coroutine` | Final stop, bounded by `timeout_ms`. The timeout is checked at the call (`TypeError`/`ValueError`). Memoized. |
+| `Tunnel.dispose` | `dispose(timeout_ms=5000) -> Coroutine` | Final stop, bounded by `timeout_ms`; after the bound it logs a warning and returns while the close goes on in the background (never aborts a socket, as JS). The timeout is checked at the call (`TypeError`/`ValueError`). Memoized. |
+| `Tunnel.abort` | `abort() -> None` | Python addition (see [DEVIATIONS](DEVIATIONS.md)). Hard stop: final like `dispose()` if it has not run, then `MixerClient.abort()` on the current connection and every one still closing, so no socket waits on a close handshake and a dial landing later is dropped. Synchronous, idempotent, on the tunnel's loop; typically after a `dispose()` that gave up. |
 | `TunnelStatus` | `TunnelStatus(state, url=None, code=None, last_error=None)`; `to_dict()` | The status. |
 | `TunnelState` | `StrEnum`: `off`, `connecting`, `online`, `disabled`, `conflict`, `error` | |
 | `TunnelStatusCode` | `StrEnum`, 13 members | See [lastError table](#lasterror-table). |
@@ -249,7 +250,7 @@ Defined in `ws_mixer.mcpwarp.threaded` and re-exported from `ws_mixer.mcpwarp`.
 | `status` | property | Lock-free; `off` before `start()` and after `stop()`. |
 | `subscribe` | `subscribe(cb) -> Callable[[], None]` | `cb` through `dispatch`; works before `start()`, survives restarts; repeats of the same status are skipped. |
 | `call_dispatched` | `async call_dispatched(fn) -> T` | Runs `fn` on the host thread; await it on the loop. |
-| `stop` | `stop(timeout=3.0) -> bool` | `dispose()` with 0.8 x timeout, abort open sockets, send a final `off` to subscribers, stop and join. True once the thread exited. Any thread, idempotent, safe before `start()` (True). From the loop thread it schedules the shutdown and returns False. NaN and negative timeouts count as 0. |
+| `stop` | `stop(timeout=3.0) -> bool` | `dispose()` with 0.8 x timeout, `Tunnel.abort()` (drops open sockets), send a final `off` to subscribers, stop and join. True once the thread exited. Any thread, idempotent, safe before `start()` (True). From the loop thread it schedules the shutdown and returns False. NaN and negative timeouts count as 0. |
 
 ### Status text
 
@@ -388,7 +389,7 @@ Names not listed are the same in both.
 | `encodeRegister`, `encodeUnregister`, `decodeEnvelope` | `encode_register`, `encode_unregister`, `decode_envelope` |
 | `webSocketFactory(ctor, {headers})` | n/a |
 | `TokenUnavailableError` | `TokenUnavailableError` (in `ws_mixer`) |
-| (none) | `ThreadedTunnel`, `sync_handler`, `target_handler`, `INTEGRATION_ID_RE`, `MCPWARP_V`, `handler_timeout_ms` |
+| (none) | `ThreadedTunnel`, `Tunnel.abort()`, `sync_handler`, `target_handler`, `INTEGRATION_ID_RE`, `MCPWARP_V`, `handler_timeout_ms`, `target_ssl_context` |
 
 ## lastError table
 

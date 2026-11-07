@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import gc
+import importlib
 import json
 import logging
 import math
 import platform
+import ssl
 import warnings
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -21,6 +23,8 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
+from tests.unit.mcpwarp.test_target import Upstream, collect
+from tests.unit.mcpwarp.test_target import request as target_request
 from ws_mixer import SDK_VERSION
 from ws_mixer.client import DisconnectReason, ReconnectOptions
 from ws_mixer.control import encode_control
@@ -241,6 +245,16 @@ VALIDATION_ROWS: list[tuple[dict[str, Any], type[Exception], str]] = [
     ({"handler_timeout_ms": math.inf}, ValueError, HANDLER_TIMEOUT_MSG + "Infinity"),
     ({"handler_timeout_ms": "5"}, TypeError, HANDLER_TIMEOUT_MSG + "str"),
     ({"handler_timeout_ms": True}, TypeError, HANDLER_TIMEOUT_MSG + "bool"),
+    (
+        {"target_ssl_context": ssl.create_default_context()},
+        TypeError,
+        "mcpwarp: `target_ssl_context` applies only to `target`",
+    ),
+    (
+        {"handler": None, "target": "https://x", "target_ssl_context": SECRET},
+        TypeError,
+        "mcpwarp: `target_ssl_context` must be an ssl.SSLContext",
+    ),
     ({"name": SECRET}, ValueError, NAME_MSG),
     ({"name": "a" * 31}, ValueError, NAME_MSG),
     ({"name": "-anki"}, ValueError, NAME_MSG),
@@ -1688,6 +1702,48 @@ async def test_target_mode_forwards_to_the_local_server(
         server.close()
         await server.wait_closed()
     await finish(env, baseline)
+
+
+# --- target_ssl_context (SDK extension, docs/DEVIATIONS.md) ---------------------------------
+
+
+@pytest.mark.parametrize("target", ["https://127.0.0.1:8443/mcp", "http://127.0.0.1:8000/mcp"])
+async def test_target_ssl_context_reaches_target_handler_unchanged(
+    target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert ExposeOptions(token="t", name=NAME, integration=UUID).target_ssl_context is None
+    expose_mod = importlib.import_module("ws_mixer.mcpwarp.expose")  # `expose` is the function
+    seen: list[dict[str, Any]] = []
+    real = expose_mod.target_handler
+
+    def spy(target: str, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return real(target, **kwargs)
+
+    monkeypatch.setattr(expose_mod, "target_handler", spy)
+    ctx = ssl.create_default_context()
+    opts = ExposeOptions(
+        token="t", name=NAME, integration=UUID, target=target, target_ssl_context=ctx
+    )
+    validate_options(opts)
+    validate_options(dataclasses.replace(opts, target_ssl_context=None))
+    assert seen[0]["ssl_context"] is ctx
+    assert seen[1]["ssl_context"] is None
+
+
+async def test_an_http_target_ignores_target_ssl_context() -> None:
+    ctx = ssl.create_default_context()
+    async with Upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") as up:
+        opts = ExposeOptions(
+            token="t",
+            name=NAME,
+            integration=UUID,
+            target=up.origin + "/mcp",
+            target_ssl_context=ctx,
+        )
+        response = await validate_options(opts)(target_request())
+        assert (response.status, await collect(response.body)) == (200, b"ok")
+        assert len(up.requests) == 1  # plain HTTP: no TLS handshake was attempted
 
 
 # --- handler_timeout_ms (SDK extension, docs/DEVIATIONS.md) ---------------------------------

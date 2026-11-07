@@ -36,9 +36,8 @@ from ws_mixer.mcpwarp import (
     TunnelState,
     TunnelStatus,
 )
-from ws_mixer.mcpwarp.threaded import _Sockets, _Tracked
 from ws_mixer.socket import SUBPROTOCOL, WebSocketConnection, WebSocketInit
-from ws_mixer.testing import FakeConnector, FakeWebSocket
+from ws_mixer.testing import FakeConnector
 
 UUID = "0f6c2a8e-4c1b-4b7e-9a4e-2f1d9b7c3a10"
 URL = "https://notes-tester.mcpwarp.test/mcp"
@@ -480,7 +479,7 @@ def test_loop_bound_clocks_are_refused() -> None:
         )
 
 
-def test_duck_typed_config_connector_is_tracked() -> None:
+def test_a_duck_typed_config_connector_is_aborted_on_stop() -> None:
     tt, default = make()
     own = connector(hold=True)
     cfg = SimpleNamespace(
@@ -494,40 +493,44 @@ def test_duck_typed_config_connector_is_tracked() -> None:
     assert own.sockets and all(ws.aborted for ws in own.sockets)
 
 
-@pytest.mark.parametrize("delegate", [True, False])
-def test_tracked_connectors_compare_by_what_they_wrap(
-    delegate: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    if not delegate:
-        monkeypatch.setattr(_Tracked, "__eq__", lambda self, other: self is other)
+def test_the_same_config_with_its_own_connector_is_a_no_op() -> None:
     tt, _ = make()
     own = connector()
     cfg = TunnelConfig(True, "tok-6f1e9d", "notes", web_socket=own)
     with tt:
         tt.configure(cfg).result(T)
         wait_until(lambda: tt.status == ONLINE)
-        tt.configure(cfg).result(T)  # the same config: a no-op only if the wrappers compare equal
+        tt.configure(cfg).result(T)
         wait_until(lambda: tt.status == ONLINE)
-    assert own.dials == (1 if delegate else 2)
+    assert own.dials == 1
 
 
-def test_a_dial_landing_after_the_teardown_is_aborted() -> None:
-    sockets = _Sockets()
-    sockets.aborted = True
+def test_a_dial_landing_after_the_teardown_is_dropped_by_the_closed_client() -> None:
+    """What the old `aborted` flag covered. The closed client drops the late socket itself, so
+    this passes even with Tunnel.abort() a no-op: the flag is unnecessary, not reimplemented."""
+    late = AutoEdge()
+    entered = threading.Event()
+    landed_after_teardown: list[bool] = []
 
-    async def dial() -> FakeWebSocket:
-        ws = FakeWebSocket()
-        ws.open()
+    async def stubborn(url: str, init: WebSocketInit) -> WebSocketConnection:
+        # Ignores cancellation, as a connector blocked in a thread would, and lands on the loop
+        # right after the teardown step, leaving LoopThread.stop() its whole settle budget.
+        entered.set()
+        while (run := tt._closing) is None or not run.torn_down.is_set():
+            try:
+                await asyncio.sleep(0.005)
+            except asyncio.CancelledError:
+                pass
+        landed_after_teardown.append(not late.aborted)
+        return late
 
-        async def inner(url: str, init: WebSocketInit) -> WebSocketConnection:
-            return ws
-
-        await _Tracked(inner, sockets)("ws://edge.test", WebSocketInit())
-        return ws
-
-    ws = asyncio.run(dial())
-    assert ws.aborted
-    assert sockets.all() == [ws]
+    tt, _ = make()
+    tt.start()
+    tt.configure(TunnelConfig(True, "tok-6f1e9d", "notes", web_socket=stubborn)).result(T)
+    assert entered.wait(T)
+    assert tt.stop(timeout=2.0)
+    assert landed_after_teardown == [True]
+    assert late.aborted
 
 
 def test_start_waits_for_a_stop_running_on_another_thread() -> None:

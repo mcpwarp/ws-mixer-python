@@ -78,6 +78,12 @@ ws-mixer-go v0.8.0 (`goserver.pin`). Python 3.11-3.14, zero runtime dependencies
   - `handler_timeout_ms` on `ExposeOptions`/`TunnelOptions` (SDK extension, handler mode only,
     default None): a handler with no response by then is cancelled and answered 504
     `local server timed out` (docs/DEVIATIONS.md).
+  - `target_ssl_context` on `ExposeOptions`/`TunnelOptions` (SDK extension, target mode only,
+    default None): the `ssl.SSLContext` passed to `target_handler()` for an https target;
+    ignored for an http one (docs/DEVIATIONS.md).
+  - `Tunnel.abort()` (not in JS): a synchronous hard stop that aborts the current connection
+    and every one still closing, for hosts that stop their loop after a `dispose()` that gave
+    up. `dispose()` itself still never aborts a socket, as in JS (docs/DEVIATIONS.md).
   - Forwarded request targets keep `[` and `]` verbatim (spec v0.6.3 section 4.3 allowed set).
   - `[` and `]` in the configured `target` URL's path and query are kept verbatim too.
   - `CONNECT`, `TRACE` and `TRACK` (any case) get `400 request cannot be represented as a web
@@ -88,7 +94,7 @@ ws-mixer-go v0.8.0 (`goserver.pin`). Python 3.11-3.14, zero runtime dependencies
   - The 431 and the 400 `incomplete request` for a head that never completes are head-only when
     its first line is a `HEAD` request line.
 - `ws_mixer.mcpwarp.ThreadedTunnel`: a tunnel on its own loop thread, with `dispatch`
-  for host main-thread callbacks.
+  for host main-thread callbacks. `stop()` drops the run's sockets through `Tunnel.abort()`.
 - `ws_mixer.testing`: `FakeClock`, `settle`, `FakeWebSocket`, `FakeConnector`, `socket_pair`,
   `FakeEdge`.
 - Conformance: `conformance/adapter/` for the spec's Go runner; floors `python-client` 25 and

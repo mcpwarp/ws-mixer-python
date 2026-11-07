@@ -126,6 +126,22 @@ async def finish(h: Harness, baseline: set[asyncio.Task[Any]]) -> None:
     assert not leaked, leaked
 
 
+class EchoWaiter(FakeWebSocket):
+    """`close()` waits for the server's close, which never comes, as real connectors do."""
+
+    def __init__(self) -> None:
+        super().__init__(echo_close=False)
+        self._gone = asyncio.Event()
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        await super().close(code, reason)
+        await self._gone.wait()
+
+    def abort(self) -> None:
+        super().abort()
+        self._gone.set()
+
+
 async def started(h: Harness) -> FakeWebSocket:
     t = h.start()
     ws = await h.welcome(0)
@@ -1159,6 +1175,55 @@ async def test_abort_drops_sockets_and_delivery(baseline: set[asyncio.Task[Any]]
     await settle()
     assert ws.aborted and h.client.state == "closed"
     assert len(h.reports) == 1 and not h.reports[0].fatal
+    await finish(h, baseline)
+
+
+async def test_abort_drops_a_socket_waiting_for_the_close_echo(
+    baseline: set[asyncio.Task[Any]],
+) -> None:
+    h = Harness()
+    ws = h.fc.add(EchoWaiter())
+    assert await started(h) is ws
+    closing = asyncio.ensure_future(h.client.close())
+    await settle()
+    assert ws.close_calls and not ws.aborted and not closing.done()
+    assert h.client.current_conn() is None  # the conn left every slot; its socket still waits
+    assert h.clock.pending() > 0  # the close bound
+    h.client.abort()
+    await settle()
+    assert ws.aborted and closing.done()
+    assert h.clock.pending() == 0
+    await finish(h, baseline)
+
+
+class AbortRaises(FakeWebSocket):
+    def abort(self) -> None:
+        raise RuntimeError("abort broke")
+
+
+async def test_a_raising_socket_abort_does_not_stop_the_rest(
+    baseline: set[asyncio.Task[Any]], caplog: pytest.LogCaptureFixture
+) -> None:
+    h = Harness()
+    first = h.fc.add(AbortRaises())
+    assert await started(h) is first
+    first.push(encode_open(1))
+    first.push(ctl({"t": "drain", "reason": "r", "last_stream_id": 1, "deadline_ms": 4000}))
+    await settle()
+    await h.clock.advance(1000)
+    second = await h.sock(1)
+    second.open()
+    await settle()  # the replacement is in its handshake: its connect task is still running
+    connect = h.client._connect_task
+    assert connect is not None and not connect.done()
+    h.client.abort()
+    await settle()
+    assert second.aborted
+    assert connect.cancelled()
+    assert h.clock.pending() == 0
+    assert [r.getMessage() for r in caplog.records if r.name == "ws_mixer"] == [
+        "aborting a socket failed"
+    ]
     await finish(h, baseline)
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import math
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -449,9 +450,13 @@ class MixerClient(Emitter):
         for conn in dict.fromkeys(c for c in conns if c is not None):
             conn.cancel_delivery()
             conn.fail(err)
-            sock = self._sockets.get(conn)
-            if sock is not None:
+        # Every socket, also those of connections already closing: they have left the slots
+        # above while their socket still waits for the peer's close (up to CLOSE_BOUND_MS).
+        for sock in list(self._sockets.values()):
+            try:
                 sock.abort()
+            except Exception:
+                logging.getLogger("ws_mixer").exception("aborting a socket failed")
         self._cancel_connect_task()
         for task in list(self._tasks):
             if task is not asyncio.current_task():

@@ -17,6 +17,7 @@ import inspect
 import json
 import logging
 import re
+import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -112,6 +113,10 @@ class ExposeOptions:
     """SDK extension (not in MCPWARP.md), `handler` only: an async handler that has not
     returned its response within this many ms is cancelled and answered 504 `local server
     timed out`. None: no deadline."""
+    target_ssl_context: ssl.SSLContext | None = None
+    """SDK extension, `target` only: the TLS context for an https target (a private CA, say),
+    not the edge's (that is the connector's `ssl_context`); ignored for an http target. None:
+    `default_ssl_context()`."""
 
 
 _FIELDS = tuple(f.name for f in dataclasses.fields(ExposeOptions))
@@ -169,6 +174,7 @@ def validate_options(opts: ExposeOptions) -> Handler:
         opts.target_timeout_ms,
         clock=opts.clock,
         handler_timeout_ms=opts.handler_timeout_ms,
+        target_ssl_context=opts.target_ssl_context,
     )
     name: object = opts.name
     if not is_valid_service_name(name):
@@ -208,10 +214,12 @@ def validate_handler_target(
     *,
     clock: Clock | None = None,
     handler_timeout_ms: object = None,
+    target_ssl_context: object = None,
 ) -> Handler:
     """Rows 1-4: exactly one of `handler`/`target`, and `target_timeout_ms` only with a valid
-    `target`; plus the SDK's own `handler_timeout_ms`, only with `handler`. Also run by
-    create_tunnel() up front."""
+    `target`; plus the SDK's own `handler_timeout_ms`, only with `handler`, and
+    `target_ssl_context`, only with `target` (passed to target_handler(), which ignores it for
+    http). Also run by create_tunnel() up front."""
     has_handler = handler is not None and callable(handler)
     has_target = target is not None
     # A non-callable `handler` is never "a handler", alone or beside a `target`.
@@ -220,6 +228,8 @@ def validate_handler_target(
     if has_handler:
         if target_timeout_ms is not None:
             raise TypeError("mcpwarp: `target_timeout_ms` applies only to `target`")
+        if target_ssl_context is not None:
+            raise TypeError("mcpwarp: `target_ssl_context` applies only to `target`")
         if handler_timeout_ms is not None:
             limit = (
                 "mcpwarp: handler_timeout_ms must be a positive number of at most "
@@ -244,7 +254,9 @@ def validate_handler_target(
         raise TypeError(f"{prefix}, got {type(timeout).__name__}")
     if not (timeout > 0) or timeout > MAX_TIMER_MS:
         raise ValueError(f"{prefix}, got {js_number(timeout)}")
-    return target_handler(target, timeout_ms=timeout, clock=clock)
+    if target_ssl_context is not None and not isinstance(target_ssl_context, ssl.SSLContext):
+        raise TypeError("mcpwarp: `target_ssl_context` must be an ssl.SSLContext")
+    return target_handler(target, timeout_ms=timeout, ssl_context=target_ssl_context, clock=clock)
 
 
 def _is_target_url(target: str) -> bool:

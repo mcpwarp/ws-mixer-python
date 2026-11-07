@@ -9,7 +9,7 @@ older one are ignored (section 6.8).
 All state lives on the event loop the tunnel is first used on; only `status` may be read from
 another thread (an immutable TunnelStatus swapped in one assignment). `configure()`, `stop()`
 and `dispose()` do all their work inside the returned coroutine, so a host thread can hand them
-to `asyncio.run_coroutine_threadsafe`.
+to `asyncio.run_coroutine_threadsafe`; `abort()` is synchronous and runs on the loop.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import math
+import ssl
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -82,6 +83,8 @@ class TunnelOptions:
     random: RandomFn | None = None
     handler_timeout_ms: float | None = None
     """As ExposeOptions.handler_timeout_ms (an SDK extension), `handler` only."""
+    target_ssl_context: ssl.SSLContext | None = None
+    """As ExposeOptions.target_ssl_context (an SDK extension), `target` only."""
 
 
 @dataclass(frozen=True)
@@ -140,6 +143,7 @@ def create_tunnel(options: TunnelOptions | None = None, /, **kwargs: Any) -> Tun
         opts.target_timeout_ms,
         clock=opts.clock,
         handler_timeout_ms=opts.handler_timeout_ms,
+        target_ssl_context=opts.target_ssl_context,
     )
     return Tunnel(opts, handler)
 
@@ -176,6 +180,8 @@ class Tunnel:
         """The latest config passed to configure(); cleared by stop(), a conflict, an error
         and an invalid config, so the same config then starts again."""
         self._active: _Active | None = None
+        self._exposures: set[Exposure] = set()
+        """The active exposure and every one still shutting down, for abort()."""
         self._draining: asyncio.Future[None] | None = None
         """Every background shutdown started so far (None: nothing to wait for)."""
         self._queue: asyncio.Task[None] | None = None
@@ -238,8 +244,9 @@ class Tunnel:
 
     def dispose(self, timeout_ms: float = DEFAULT_DISPOSE_TIMEOUT_MS) -> Coroutine[Any, Any, None]:
         """Final stop: "off" is delivered, listeners are dropped, and the shutdown is awaited
-        for at most `timeout_ms` (it then goes on in the background). Afterwards configure()
-        and stop() do nothing. Every call returns the first call's result.
+        for at most `timeout_ms` (it then goes on in the background; abort() cuts it short).
+        Afterwards configure() and stop() do nothing. Every call returns the first call's
+        result.
 
         `timeout_ms` is checked here, before the coroutine is created: TypeError for a
         non-number, ValueError for one that is not positive and finite."""
@@ -248,6 +255,19 @@ class Tunnel:
         if not math.isfinite(timeout_ms) or timeout_ms <= 0:
             raise ValueError("mcpwarp: dispose() `timeout_ms` must be a positive finite number")
         return self._dispose(timeout_ms)
+
+    def abort(self) -> None:
+        """Hard stop (not in JS): final like dispose() if it has not run, then
+        `MixerClient.abort()` on the current connection and on every one still shutting down,
+        so no socket waits on a close handshake and a dial that lands later is aborted.
+        Synchronous and idempotent; call it on the tunnel's loop, typically after a dispose()
+        that gave up. Pending dispose() calls then finish promptly."""
+        self._finalize()
+        for exposure in list(self._exposures):
+            try:
+                exposure.client.abort()
+            except Exception as e:
+                self._log(_WARN, f"error while aborting: {_message(e)}")
 
     # --- configure -----------------------------------------------------------------------
 
@@ -401,6 +421,7 @@ class Tunnel:
         # Every outcome is observed through the hooks; the task's own result settles nothing.
         task.add_done_callback(_retrieve)
         self._active = _Active(gen, exposure, task, client_closes)
+        self._exposures.add(exposure)
 
     def _observe(self, event: str, payload: object, detail: str | None, cfg: _Desired) -> None:
         """One exposure event of the current generation (JS tunnel.ts observe())."""
@@ -518,6 +539,10 @@ class Tunnel:
                 await fut
         except Exception as e:
             self._log(_WARN, f"error while closing: {_message(e)}")
+        finally:
+            # Also when this task is cancelled while the shielded close goes on; only loop
+            # shutdown cancels it (dispose()'s wait is shielded), after any abort() a host runs.
+            self._exposures.discard(a.exposure)
 
     # --- dispose -------------------------------------------------------------------------
 
@@ -525,14 +550,19 @@ class Tunnel:
         if self._closing is None:
             # Final at this coroutine's first step, so a configure()/stop() scheduled after it
             # is a no-op; only the bounded wait goes in the task.
-            self._closed = True
-            self._desired = None
-            self._detach()
-            self._set_status(_OFF)
-            self._listeners.clear()
+            self._finalize()
             loop = asyncio.get_running_loop()
             self._closing = loop.create_task(self._wait_bounded(timeout_ms))
         await asyncio.shield(self._closing)
+
+    def _finalize(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._desired = None
+        self._detach()
+        self._set_status(_OFF)
+        self._listeners.clear()
 
     async def _wait_bounded(self, timeout_ms: float) -> None:
         loop = asyncio.get_running_loop()

@@ -1,7 +1,7 @@
 # Deviations
 
 Every known place where this SDK differs from the spec text at `spec.pin` (v0.8.2) or from
-ws-mixer-js 0.11.2, and why. Each entry has one mark:
+ws-mixer-js 0.11.4, and why. Each entry has one mark:
 
 - **spec-ruled**: the spec session ruled on it, the ruling is not in the pinned text yet, and
   the SDK already follows it.
@@ -423,6 +423,17 @@ be), and `sync_handler`'s thread runs to completion with its result dropped. All
 None, applies no deadline, as the spec does. Anki sets 25 s so its 504 lands before the edge's own
 30 s timeout.
 
+### `target_ssl_context` for https targets (Python choice)
+
+JS target mode calls the runtime's `fetch`, so a private CA is the host's concern (or a custom
+handler). `ExposeOptions.target_ssl_context` and `TunnelOptions.target_ssl_context` pass an
+`ssl.SSLContext` through to `target_handler()` unchanged, so a host with an https local target
+and its own CA need not build the handler itself. The `target_` prefix keeps it apart from the
+connectors' `ssl_context`, which is the edge's TLS. `target` only: with `handler` it is a
+`TypeError`, as `target_timeout_ms` is. An http target ignores it (`target_handler()` already did), so a host can
+pass one context whichever scheme its user typed. The default, None, keeps the existing
+behaviour: `default_ssl_context()` for https.
+
 ### The request body is always buffered (Python choice)
 
 `Request.body` is the whole body, read and size-checked before the handler runs. The
@@ -534,6 +545,17 @@ closed (never awaited) and a warning is logged.
 the timeout to `dispose()`. A graceful close is unregister (up to 2 s) plus drain (up to 5 s); a
 2 s default (the proposal's first draft) would regularly cut the unregister short.
 
+### `Tunnel.abort()`: a hard stop after `dispose()` (Python choice)
+
+JS has no abort path: `dispose()` resolves after its bound with a warning and leaves the old
+connection closing in the background, and Python's `dispose()` does the same. A host that stops
+its loop right after (ThreadedTunnel, Blender) would otherwise leave a socket waiting on a server
+that never answers the close. `Tunnel.abort()` is final like `dispose()` and calls
+`MixerClient.abort()` on the current connection and on every one still closing. It is a separate
+synchronous method, not a `dispose()` flag: `dispose()` is memoized, so a flag on a later call
+would be silently ignored, and `ThreadedTunnel.stop(timeout=0)` skips `dispose()` (which takes no
+zero timeout) but must still abort. `ThreadedTunnel.stop()` calls it after its `dispose()`.
+
 ## Python versus JS behaviour
 
 ### Unknown state labels use `str()` (JS deviation)
@@ -558,5 +580,5 @@ duck-typing the token-unavailable marker.
 
 Not in JS, documented here so they are not mistaken for spec features: `token_refresh_requested()`,
 public `on_reconnect`, `MixerClient.abort()`, `on`/`once` returning an unsubscribe function,
-`LoopThread`, `ThreadedTunnel`, `sync_handler`, `target_handler` as a public name, `Timing`
-as a public dataclass, and `handler_timeout_ms`.
+`LoopThread`, `ThreadedTunnel`, `Tunnel.abort()`, `sync_handler`, `target_handler` as a public
+name, `Timing` as a public dataclass, `handler_timeout_ms`, and `target_ssl_context`.

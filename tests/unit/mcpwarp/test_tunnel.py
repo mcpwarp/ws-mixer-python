@@ -11,8 +11,10 @@ the tunnel.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
+import ssl
 import threading
 from collections.abc import Awaitable
 from types import SimpleNamespace
@@ -212,6 +214,20 @@ async def test_create_tunnel_needs_no_loop_and_starts_off() -> None:
             ValueError,
             "handler_timeout_ms must be a positive number",
         ),
+        (
+            {
+                "integration": UUID,
+                "handler": handler,
+                "target_ssl_context": ssl.create_default_context(),
+            },
+            TypeError,
+            "`target_ssl_context` applies only to `target`",
+        ),
+        (
+            {"integration": UUID, "target": "https://x", "target_ssl_context": "ca.pem"},
+            TypeError,
+            "`target_ssl_context` must be an ssl.SSLContext",
+        ),
     ],
 )
 async def test_create_tunnel_validates_up_front(
@@ -229,6 +245,26 @@ async def test_handler_timeout_ms_reaches_each_exposure() -> None:
     assert active is not None
     assert active.exposure._opts.handler_timeout_ms == 25_000
     await env.finish()
+
+
+async def test_target_ssl_context_reaches_the_target_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert TunnelOptions(integration=UUID).target_ssl_context is None
+    expose_mod = importlib.import_module("ws_mixer.mcpwarp.expose")  # `expose` is the function
+    seen: list[dict[str, Any]] = []
+    real = expose_mod.target_handler
+
+    def spy(target: str, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return real(target, **kwargs)
+
+    monkeypatch.setattr(expose_mod, "target_handler", spy)
+    ctx = ssl.create_default_context()
+    create_tunnel(
+        TunnelOptions(integration=UUID, target="https://127.0.0.1:8443", target_ssl_context=ctx)
+    )
+    assert [k["ssl_context"] for k in seen] == [ctx]
 
 
 async def test_create_tunnel_takes_options_or_kwargs_not_both() -> None:
@@ -660,6 +696,105 @@ async def test_dispose_gives_up_after_its_timeout_while_the_close_goes_on(
     # The background close still runs its own budget: unregister wait, then the close bound.
     await env.clock.advance(7000)
     assert env.sock().closed
+    await env.finish()
+
+
+async def test_abort_after_a_dispose_that_gave_up_leaves_nothing_behind() -> None:
+    env = Env()
+    await env.online()
+    env.sock().hold()
+    disposing = env.call(env.tunnel.dispose(timeout_ms=100))
+    await env.clock.advance(100)
+    assert disposing.done()
+    assert not env.sock().aborted
+    env.tunnel.abort()
+    env.tunnel.abort()
+    assert env.sock().aborted
+    for _ in range(5):
+        await env.settle()
+    # No time passed: nothing was left waiting on the unregister or close budgets.
+    assert env.clock.pending() == 0
+    leaked = set(asyncio.all_tasks()) - env.baseline - {asyncio.current_task()}
+    assert not leaked, leaked
+    await env.finish()
+
+
+class EchoWaitingEdge(EdgeSocket):
+    """`close()` waits for the edge's close, which never comes, as real connectors do."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._gone = asyncio.Event()
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        await super().close(code, reason)
+        await self._gone.wait()
+
+    def abort(self) -> None:
+        super().abort()
+        self._gone.set()
+
+
+async def test_abort_during_the_close_handshake_drops_the_socket() -> None:
+    connector = FakeConnector(factory=lambda url, init: EchoWaitingEdge())
+    env = Env(web_socket=connector)
+    env.connector = connector
+    await env.online()
+    env.sock().hold()
+    disposing = env.call(env.tunnel.dispose(timeout_ms=100_000))
+    await env.clock.advance(2000)  # the unregister budget; then the graceful close begins
+    assert env.sock().close_calls and not env.sock().aborted
+    assert not disposing.done()
+    assert env.tunnel._exposures  # its connection already left the client's slots
+    env.tunnel.abort()
+    for _ in range(5):
+        await env.settle()
+    assert env.sock().aborted
+    assert disposing.done()
+    assert env.clock.pending() == 0
+    assert not env.tunnel._exposures
+    await env.finish()
+
+
+async def test_abort_alone_is_final_and_a_later_dispose_returns_at_once() -> None:
+    env = Env()
+    await env.online()
+    env.sock().hold()
+    env.tunnel.abort()
+    assert env.snaps[-1] == {"state": "off"}
+    assert env.sock().aborted
+    disposing = env.call(env.tunnel.dispose())
+    env.configure(TunnelConfig(True, "t2", "notes"))
+    for _ in range(5):
+        await env.settle()
+    assert disposing.done()
+    assert env.connector.dials == 1
+    assert env.clock.pending() == 0
+    await env.finish()
+
+
+async def test_abort_drops_a_dial_that_lands_after_it() -> None:
+    late = EdgeSocket()
+    late.open()
+    release: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    async def stubborn(url: str, init: WebSocketInit) -> WebSocketConnection:
+        while not release.done():
+            try:
+                await asyncio.shield(release)
+            except asyncio.CancelledError:
+                pass  # ignores cancellation, as a connector blocked elsewhere would
+        return late
+
+    env = Env(web_socket=stubborn)
+    env.configure(TunnelConfig(True, TOKEN, "notes"))
+    await env.settle()
+    env.tunnel.abort()
+    await env.settle()
+    assert not late.aborted
+    release.set_result(None)
+    await env.settle()
+    assert late.aborted
     await env.finish()
 
 
