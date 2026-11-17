@@ -28,7 +28,8 @@ def _system_store_exists() -> bool:
         return True
     if paths.capath and os.path.isdir(paths.capath):
         try:
-            return any(os.scandir(paths.capath))
+            with os.scandir(paths.capath) as entries:
+                return any(entries)
         except OSError:
             return False
     return False
